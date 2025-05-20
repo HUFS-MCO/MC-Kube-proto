@@ -1,0 +1,9 @@
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  labels:
+    app.kubernetes.io/name: mc-kube
+    app.kubernetes.io/managed-by: kustomize
+  name: mckube-sample
+spec:
+  # TODO(user): Add fields here

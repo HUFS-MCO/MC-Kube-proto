@@ -1,0 +1,23 @@
+# permissions for end users to view mckubes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: mc-kube
+    app.kubernetes.io/managed-by: kustomize
+  name: mckube-viewer-role
+rules:
+- apiGroups:
+  - mcoperator.sdv.com
+  resources:
+  - mckubes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - mcoperator.sdv.com
+  resources:
+  - mckubes/status
+  verbs:
+  - get
