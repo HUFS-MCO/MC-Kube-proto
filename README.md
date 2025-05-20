@@ -8,3 +8,5 @@ CGO_ENABLED=0 operator-sdk create api --group mcoperator --version v1 --kind McK
 resources=mckuberealtimes
 
 pod.Labels["sdv.com"]]
+
+dockerhub: https://hub.docker.com/repository/docker/woya031/mckube/general
