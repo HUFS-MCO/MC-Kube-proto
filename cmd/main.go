@@ -23,6 +23,8 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"go.uber.org/zap/zapcore"
+	"k8s.io/client-go/dynamic"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -71,6 +73,7 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
 		Development: true,
+		Level: zapcore.Level(0),
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -144,10 +147,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.McKubeReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	reconciler := &controller.Cwsdv1Reconciler{
+        Client: mgr.GetClient(),
+        Scheme: mgr.GetScheme(),
+        DynamicClient: dynamic.NewForConfigOrDie(mgr.GetConfig()),
+    }
+
+	if err = reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "McKube")
 		os.Exit(1)
 	}
@@ -161,6 +167,9 @@ func main() {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
+
+	setupLog.Info("starting thread for taint timeout McKube")
+    reconciler.StartTaintThread()
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
