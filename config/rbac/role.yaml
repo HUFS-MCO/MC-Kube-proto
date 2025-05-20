@@ -1,11 +1,61 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: mc-kube
-    app.kubernetes.io/managed-by: kustomize
   name: manager-role
 rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - nodes/status
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - mcoperator
+  resources:
+  - mckuberealtimes
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - mcoperator.sdv.com
+  resources:
+  - mckubes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - mcoperator.sdv.com
+  resources:
+  - mckubes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - mcoperator.sdv.com
+  resources:
+  - mckubes/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - metrics.k8s.io
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
