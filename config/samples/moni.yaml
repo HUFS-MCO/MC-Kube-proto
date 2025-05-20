@@ -1,0 +1,12 @@
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  labels:
+    app.kubernetes.io/name: cwsdv1
+    app.kubernetes.io/managed-by: kustomize
+  name: cwsdv1-sample
+spec:
+  node: ice-sub-02
+  podname: cwi-nginx-deployment-8969b4455-dpg42
+  pressuredDeadlinesPeriod: 11
+  pressuredDeadlinesTotal: 0

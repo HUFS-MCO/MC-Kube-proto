@@ -1,0 +1,41 @@
+apiVersion: mcoperator.sdv.com/v1
+kind: McKubeRealtime
+metadata:
+  name: example-realtime-data
+spec:
+  criticality: C
+  rtPeriod: 100
+  rtDeadline: 100
+  rtWcets:
+    - node: nodeA
+      rtWcet: 50
+    - node: nodeB
+      rtWcet: 60
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cwi-nginx-deployment
+  labels:
+    app: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+        sdv.com: example-realtime-data
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.14.2
+          ports:
+            - containerPort: 80
+      tolerations:
+        - key: "RealTime"
+          operator: "Equal"
+          value: "RT"
+          effect: "NoSchedule"
