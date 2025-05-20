@@ -6,3 +6,5 @@ operator-sdk init --domain sdv.com --repo mc-kube
 CGO_ENABLED=0 operator-sdk create api --group mcoperator --version v1 --kind McKube --resource --controller
 
 resources=mckuberealtimes
+
+pod.Labels["sdv.com"]]
