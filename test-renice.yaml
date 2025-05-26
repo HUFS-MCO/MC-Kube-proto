@@ -28,7 +28,7 @@ spec:
         memory: "1Gi"
 ---
 apiVersion: mcoperator.sdv.com/v1
-kind: RealTime
+kind: McKubeRealtime
 metadata:
   name: test-rt-app
   namespace: default
@@ -39,13 +39,3 @@ spec:
   rtWcets:
   - node: ""  # Will be automatically filled after pod scheduling
     rtWcet: 50
----
-apiVersion: mcoperator.sdv.com/v1
-kind: McKube
-metadata:
-  name: test-rt-monitor
-  namespace: default
-spec:
-  podName: test-rt-pod
-  node: ""  # Will be automatically filled after pod scheduling
-  pressuredDeadlinesPeriod: 0 

@@ -17,13 +17,13 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	errorsGo "errors"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -226,10 +226,15 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Check if pod is newly created and set initial nice value
 	if targetPod.Status.Phase == corev1.PodPending || targetPod.Status.Phase == corev1.PodRunning {
+		loggerHighPrio.Info("Checking pod for renice", "pod", targetPod.Name, "phase", targetPod.Status.Phase)
 		if appName, ok := targetPod.Labels["sdv.com"]; ok && appName != "" {
+			loggerHighPrio.Info("Found app label", "app", appName)
 			realTimeData, err := r.GetRealTimeData(ctx)
-			if err == nil {
+			if err != nil {
+				logger.Error(err, "Failed to get realtime data")
+			} else {
 				if rtItem, ok := realTimeData[appName]; ok {
+					loggerHighPrio.Info("Found realtime data", "app", appName, "criticality", rtItem.Criticality)
 					var desiredNiceValue int
 					switch rtItem.Criticality {
 					case "A":
@@ -243,14 +248,21 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 					}
 
 					if nodeIP != "" {
+						loggerHighPrio.Info("Sending renice request", "pod", targetPod.Name, "nodeIP", nodeIP, "niceValue", desiredNiceValue)
 						if err := r.sendReniceRequest(ctx, targetPod, nodeIP, desiredNiceValue); err != nil {
-							logger.Error(err, "Failed to send initial renice request")
+							logger.Error(err, "Failed to send initial renice request", "pod", targetPod.Name, "nodeIP", nodeIP)
 						} else {
-							loggerHighPrio.Info("Set initial nice value for pod", "Pod", targetPod.Name, "NiceValue", desiredNiceValue)
+							loggerHighPrio.Info("Successfully sent renice request", "pod", targetPod.Name)
 						}
+					} else {
+						logger.Error(nil, "Node IP is empty", "pod", targetPod.Name)
 					}
+				} else {
+					loggerHighPrio.Info("No realtime data found for app", "app", appName)
 				}
 			}
+		} else {
+			loggerHighPrio.Info("No app label found on pod", "pod", targetPod.Name)
 		}
 	}
 
@@ -378,8 +390,9 @@ func (r *McKubeReconciler) GetRealTimeData(ctx context.Context) (map[string]Real
 	resultErr := make(map[string]RealTimeData)
 	result := make(map[string]RealTimeData)
 
-	items, err := r.GetResourcesDynamically(ctx, "mcoperator", "v1", "realtimes", "default")
+	items, err := r.GetResourcesDynamically(ctx, "mcoperator.sdv.com", "v1", "mckuberealtime", "default")
 	if err != nil {
+		log.Log.Error(err, "Failed to get McKubeRealtime resources")
 		return resultErr, err
 	} else {
 		// For each unstructured item in the list, we get the fields and compile an ad-hoc data strcture manually
