@@ -19,7 +19,11 @@ package controller
 import (
 	"context"
 	errorsGo "errors"
-	// "sort"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httputil"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -89,6 +93,58 @@ const polling_rate = 10
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
 
+// sendReniceRequest sends an HTTP POST request to the renicer daemon on the target node
+func (r *McKubeReconciler) sendReniceRequest(ctx context.Context, pod *corev1.Pod, nodeIP string, niceValue int) error {
+	logger := log.Log.WithValues("McKube/rt", pod.Namespace, "pod", pod.Name)
+	logger.V(0).Info("Sending renice request", "pod", pod.Name, "nodeIP", nodeIP, "niceValue", niceValue)
+
+	// Find the container ID. Assuming the first container for simplicity.
+	if len(pod.Status.ContainerStatuses) == 0 {
+		return errorsGo.New("pod has no container statuses")
+	}
+	containerID := pod.Status.ContainerStatuses[0].ContainerID
+	if containerID == "" {
+		return errorsGo.New("container ID is empty")
+	}
+
+	// Prepare the request payload
+	payload := map[string]interface{}{
+		"container_id": containerID,
+		"nice":         niceValue,
+	}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		logger.Error(err, "Failed to marshal renice request payload")
+		return err
+	}
+
+	// Construct the URL for the renicer daemon
+	url := fmt.Sprintf("http://%s:8080/renice", nodeIP)
+
+	// Create and send the HTTP POST request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		logger.Error(err, "Failed to create HTTP request for renice")
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Error(err, "Failed to send HTTP request to renicer daemon")
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("renicer daemon returned non-OK status: %s, body: %s", resp.Status, string(bodyBytes))
+	}
+
+	logger.V(0).Info("Successfully sent renice request")
+	return nil
+}
 
 func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = log.FromContext(ctx)
@@ -154,6 +210,48 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if foundPod == -1 || podList.Items[foundPod].Name != rt.Spec.PodName {
 		loggerLowPrio.Info("Checking if pod exists: Pod not found. Ignoring...")
 		return ctrl.Result{}, nil
+	}
+
+	// Get the target pod
+	targetPod := &podList.Items[foundPod]
+
+	// Get node IP for renicer daemon
+	var nodeIP string
+	for _, addr := range foundNode.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP {
+			nodeIP = addr.Address
+			break
+		}
+	}
+
+	// Check if pod is newly created and set initial nice value
+	if targetPod.Status.Phase == corev1.PodPending || targetPod.Status.Phase == corev1.PodRunning {
+		if appName, ok := targetPod.Labels["sdv.com"]; ok && appName != "" {
+			realTimeData, err := r.GetRealTimeData(ctx)
+			if err == nil {
+				if rtItem, ok := realTimeData[appName]; ok {
+					var desiredNiceValue int
+					switch rtItem.Criticality {
+					case "A":
+						desiredNiceValue = 0
+					case "B":
+						desiredNiceValue = -10
+					case "C":
+						desiredNiceValue = -15
+					default:
+						desiredNiceValue = 0
+					}
+
+					if nodeIP != "" {
+						if err := r.sendReniceRequest(ctx, targetPod, nodeIP, desiredNiceValue); err != nil {
+							logger.Error(err, "Failed to send initial renice request")
+						} else {
+							loggerHighPrio.Info("Set initial nice value for pod", "Pod", targetPod.Name, "NiceValue", desiredNiceValue)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// The pod and node exist, check if req missedDeadlinesPeriod are higher than VALUE
