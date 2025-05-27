@@ -549,14 +549,14 @@ func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // findObjectsForPod finds McKube objects for a given pod
-func (r *McKubeReconciler) findObjectsForPod(pod client.Object) []reconcile.Request {
+func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Object) []reconcile.Request {
 	if pod.GetNamespace() != "default" {
 		return []reconcile.Request{}
 	}
 
 	// Find McKube resources that might be affected by this pod
 	mckubeList := &mcoperatorv1.McKubeList{}
-	if err := r.List(context.Background(), mckubeList, client.InNamespace("default")); err != nil {
+	if err := r.List(ctx, mckubeList, client.InNamespace("default")); err != nil {
 		return []reconcile.Request{}
 	}
 
