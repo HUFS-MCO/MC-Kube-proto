@@ -39,3 +39,14 @@ spec:
   rtWcets:
   - node: ""  # Will be automatically filled after pod scheduling
     rtWcet: 50
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: test-rt-pod-monitor
+  namespace: default
+spec:
+  podname: test-rt-pod
+  node: ""
+  pressuredDeadlinesTotal: 0
+  pressuredDeadlinesPeriod: 0

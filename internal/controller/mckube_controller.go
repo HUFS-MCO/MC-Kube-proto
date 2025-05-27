@@ -172,7 +172,55 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	loggerLowPrio.Info("McKube resource fetched successfully")
 
-	// Check if node specified in monitoring object exists
+	// Check if the PodName is specified in the McKube resource
+	if rt.Spec.PodName == "" {
+		loggerHighPrio.Info("McKube resource has empty PodName. Ignoring...")
+		return ctrl.Result{}, nil
+	}
+
+	// If node is not specified in the McKube resource, get the corresponding Pod and update the node
+	if rt.Spec.Node == "" {
+		loggerLowPrio.Info("McKube resource has empty Node field. Attempting to find Pod and update Node.")
+		// Get the Pod based on PodName
+		podList := &corev1.PodList{}
+		opts := []client.ListOption{
+			client.InNamespace(rt.Namespace),
+			client.MatchingFields{".metadata.name": rt.Spec.PodName},
+		}
+		err = r.List(ctx, podList, opts...)
+		if err != nil {
+			logger.Error(err, "Failed to list pods to find target pod")
+			return ctrl.Result{}, err
+		}
+
+		if len(podList.Items) == 0 {
+			loggerLowPrio.Info("Target pod not found. Requeuing...")
+			return ctrl.Result{RequeueAfter: time.Second * 5}, nil // Requeue if pod not found yet
+		}
+
+		targetPod := &podList.Items[0] // Assuming Pod names are unique within a namespace
+
+		// Check if the pod is scheduled and node information is available
+		if targetPod.Spec.NodeName == "" || (targetPod.Status.Phase != corev1.PodRunning && targetPod.Status.Phase != corev1.PodPending) {
+			loggerLowPrio.Info("Target pod not yet scheduled or not in Running/Pending phase. Requeuing...", "podPhase", targetPod.Status.Phase)
+			return ctrl.Result{RequeueAfter: time.Second * 5}, nil // Requeue if pod not scheduled yet
+		}
+
+		// Update the McKube resource with the node name
+		rt.Spec.Node = targetPod.Spec.NodeName
+		loggerHighPrio.Info("Updating McKube resource with Node name", "nodeName", rt.Spec.Node)
+		err = r.Update(ctx, rt)
+		if err != nil {
+			logger.Error(err, "Failed to update McKube resource with node name")
+			return ctrl.Result{}, err
+		}
+
+		loggerHighPrio.Info("McKube resource updated with Node name. Requeuing to process...")
+		return ctrl.Result{RequeueAfter: time.Second * 1}, nil // Requeue immediately to process with updated node
+	}
+
+	// Check if node specified in monitoring object exists - This check is now redundant if rt.Spec.Node is guaranteed to be filled
+	// However, keeping it for safety or if there are other ways spec.Node can be set initially
 	foundNode := &corev1.Node{}
 	loggerLowPrio.Info("Checking if node exists:", "Node", rt.Spec.Node)
 	err = r.Get(ctx, types.NamespacedName{Name: rt.Spec.Node}, foundNode)
