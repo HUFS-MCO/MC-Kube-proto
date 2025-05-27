@@ -151,17 +151,16 @@ func (r *McKubeReconciler) sendReniceRequest(ctx context.Context, pod *corev1.Po
 func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = log.FromContext(ctx)
 
-	// TODO(user): your logic here
-
 	defer duration(track("Reconcile")) // This call measures the Reconcile run-time
 	logger := log.Log.WithValues("McKube/rt", req.NamespacedName)
 	loggerLowPrio := logger.V(1)  // Debug level
 	loggerHighPrio := logger.V(0) // Info level
-	loggerLowPrio.Info("Mc-Kube/rt Reconcile method")
+	loggerLowPrio.Info("Mc-Kube/rt Reconcile method started")
 
 	rt := &mcoperatorv1.McKube{}
 
 	// Verify if monitoring object still exists
+	loggerLowPrio.Info("Fetching McKube resource")
 	err := r.Get(ctx, req.NamespacedName, rt)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -171,6 +170,7 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		logger.Error(err, "Failed to get McKube/rt instance")
 		return ctrl.Result{}, err
 	}
+	loggerLowPrio.Info("McKube resource fetched successfully")
 
 	// Check if node specified in monitoring object exists
 	foundNode := &corev1.Node{}
@@ -184,24 +184,27 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		logger.Error(err, "Failed to get node instance for comparison with RT")
 		return ctrl.Result{}, err
 	}
+	loggerLowPrio.Info("Node exists")
 
 	// Check if pod specified in monitoring object exists
 	podList := &corev1.PodList{}
-	loggerLowPrio.Info("Checking if pod exists:", "Pod", rt.Spec.PodName)
+	loggerLowPrio.Info("Listing pods in namespace", "namespace", "default")
 	opts := []client.ListOption{
 		client.InNamespace("default"),
 	}
 	err = r.List(ctx, podList, opts...)
 	if err != nil {
 		if podList.Size() == 0 {
-			logger.Error(err, "Checking if pod exists: empty PodList")
+			logger.Error(err, "Checking if pod exists: error listing PodList")
 			return ctrl.Result{}, err
 		}
 		logger.Error(err, "Failed to get PodList instance for comparison with RT")
 		return ctrl.Result{}, err
 	}
+	loggerLowPrio.Info("Pod list obtained", "podCount", len(podList.Items))
 
 	foundPod := -1
+	loggerLowPrio.Info("Searching for target pod in list", "targetPodName", rt.Spec.PodName)
 	for i, pod := range podList.Items {
 		if pod.Name == rt.Spec.PodName {
 			foundPod = i
@@ -210,15 +213,17 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if foundPod == -1 || podList.Items[foundPod].Name != rt.Spec.PodName {
-		loggerLowPrio.Info("Checking if pod exists: Pod not found. Ignoring...")
+		loggerLowPrio.Info("Checking if pod exists: Pod not found in list. Ignoring...")
 		return ctrl.Result{}, nil
 	}
+	loggerLowPrio.Info("Target pod found in list")
 
 	// Get the target pod
 	targetPod := &podList.Items[foundPod]
 
 	// Get node IP for renicer daemon
 	var nodeIP string
+	loggerLowPrio.Info("Fetching Node IP")
 	for _, addr := range foundNode.Status.Addresses {
 		if addr.Type == corev1.NodeInternalIP {
 			nodeIP = addr.Address
@@ -227,10 +232,12 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// Check if pod is newly created and set initial nice value
+	loggerLowPrio.Info("Checking pod phase and labels for renice eligibility")
 	if targetPod.Status.Phase == corev1.PodPending || targetPod.Status.Phase == corev1.PodRunning {
 		loggerHighPrio.Info("Checking pod for renice", "pod", targetPod.Name, "phase", targetPod.Status.Phase)
 		if appName, ok := targetPod.Labels["sdv.com"]; ok && appName != "" {
 			loggerHighPrio.Info("Found app label", "app", appName)
+			loggerLowPrio.Info("Fetching realtime data")
 			realTimeData, err := r.GetRealTimeData(ctx)
 			if err != nil {
 				logger.Error(err, "Failed to get realtime data")
@@ -249,6 +256,8 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 						desiredNiceValue = 0
 					}
 
+					loggerLowPrio.Info("Determined desired nice value", "niceValue", desiredNiceValue)
+
 					if nodeIP != "" {
 						loggerHighPrio.Info("Sending renice request", "pod", targetPod.Name, "nodeIP", nodeIP, "niceValue", desiredNiceValue)
 						if err := r.sendReniceRequest(ctx, targetPod, nodeIP, desiredNiceValue); err != nil {
@@ -266,17 +275,22 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		} else {
 			loggerHighPrio.Info("No app label found on pod", "pod", targetPod.Name)
 		}
+	} else {
+		loggerLowPrio.Info("Pod not in Pending or Running phase, skipping renice check", "pod", targetPod.Name, "phase", targetPod.Status.Phase)
 	}
 
 	// The pod and node exist, check if req missedDeadlinesPeriod are higher than VALUE
+	loggerLowPrio.Info("Checking pressured deadlines period", "PressuredDeadlinesPeriod", rt.Spec.PressuredDeadlinesPeriod)
 	if rt.Spec.PressuredDeadlinesPeriod > 10 {
 		loggerLowPrio.Info("Deleting pod: too many pressured RT deadlines", "PressuredDeadlinesPeriod", rt.Spec.PressuredDeadlinesPeriod)
 
 		// Taint the node so that no other pod can be scheduled on it
+		loggerLowPrio.Info("Checking node for taint McKubeRTDeadlinePressure")
 		taintExists := false
 		for _, taint := range foundNode.Spec.Taints {
 			if taint.Key == "McKubeRTDeadlinePressure" {
 				taintExists = true
+				break
 			}
 		}
 		if taintExists {
@@ -299,90 +313,121 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 		// Delete the victim pod with some policy # selectPodVictimForDeletion(rt, podList)
 		// Delete the current pod
+		loggerLowPrio.Info("Selecting pod victim for deletion")
 		victimPod := r.selectPodVictimForDeletion(rt, podList)
 		if victimPod == nil {
 			loggerHighPrio.Info("No pod can be evicted")
 			return ctrl.Result{}, nil
 		}
+		loggerHighPrio.Info("Deleting Pod", "Pod", victimPod.Name)
 		err = r.Delete(ctx, victimPod)
-		loggerHighPrio.Info("Deleting Pod", "Pod", victimPod)
 		if err != nil {
 			if errors.IsNotFound(err) {
 				loggerHighPrio.Info("Pod not found. Ignoring since pod must be deleted")
 				return ctrl.Result{}, nil
 			}
-			logger.Error(err, "Error while deleting pod", "Pod", victimPod)
+			logger.Error(err, "Error while deleting pod", "Pod", victimPod.Name)
 			return ctrl.Result{}, err
 		}
+		loggerLowPrio.Info("Pod deletion initiated", "Pod", victimPod.Name)
 	}
+	loggerLowPrio.Info("Reconcile method finished")
 	return ctrl.Result{}, nil
 }
 
 func (r *McKubeReconciler) selectPodVictimForDeletion(rt *mcoperatorv1.McKube, podList *corev1.PodList) *corev1.Pod {
+	log.Log.V(1).Info("Inside selectPodVictimForDeletion")
 	listMetrics, err := listMetrics()
 	if err != nil {
 		log.Log.Error(err, "selectPodVictimForDeletion: error retrieving pods metrics")
 		return &corev1.Pod{}
 	}
+	log.Log.V(1).Info("Pods metrics retrieved")
 	realTimeData, err := r.GetRealTimeData(context.TODO())
 	if err != nil {
-		log.Log.Error(err, "could not obtain RT data")
+		log.Log.Error(err, "selectPodVictimForDeletion: could not obtain RT data")
+		return &corev1.Pod{}
 	} else {
+		log.Log.V(1).Info("RealTime data obtained")
 		max_nonRT := *resource.NewQuantity(0, "DecimalSI")
 		max_RT := *resource.NewQuantity(0, "DecimalSI")
 		res_nonRT := &corev1.Pod{}
 		res_RT := &corev1.Pod{}
 
+		log.Log.V(1).Info("Iterating through pod list to find victim")
 		for i, pod := range podList.Items {
 			var usagePod resource.Quantity
 			if metricsItem, ok := listMetrics[pod.Name]; ok {
 				usagePod = metricsItem["cpu"]
+				log.Log.V(1).Info("Pod metrics found", "pod", pod.Name, "cpu", usagePod.String())
+			} else {
+				log.Log.V(1).Info("Pod metrics not found", "pod", pod.Name)
+				continue
 			}
+
 			if rtItem, ok := realTimeData[pod.Labels["sdv.com"]]; ok {
+				log.Log.V(1).Info("Pod has RT label", "pod", pod.Name, "criticality", rtItem.Criticality)
 				if rtItem.Criticality != "C" {
 					if usagePod.AsDec().Cmp(max_RT.AsDec()) > 0 {
 						max_RT = usagePod
 						res_RT = &podList.Items[i]
+						log.Log.V(1).Info("Found potential RT victim", "pod", res_RT.Name, "cpu", max_RT.String())
 					}
 				}
 			} else {
+				log.Log.V(1).Info("Pod does not have RT label", "pod", pod.Name)
 				if usagePod.AsDec().Cmp(max_nonRT.AsDec()) > 0 {
 					max_nonRT = usagePod
 					res_nonRT = &podList.Items[i]
+					log.Log.V(1).Info("Found potential non-RT victim", "pod", res_nonRT.Name, "cpu", max_nonRT.String())
 				}
 			}
 		}
+		log.Log.V(1).Info("Finished iterating through pod list")
+
 		if max_nonRT.AsDec().Cmp(resource.NewQuantity(0, "DecimalSI").AsDec()) > 0 && res_nonRT != nil {
+			log.Log.V(1).Info("Returning non-RT victim", "pod", res_nonRT.Name)
 			return res_nonRT
 		} else if max_RT.AsDec().Cmp(resource.NewQuantity(0, "DecimalSI").AsDec()) > 0 && res_RT != nil {
+			log.Log.V(1).Info("Returning RT victim", "pod", res_RT.Name)
 			return res_RT
 		}
 	}
+	log.Log.V(1).Info("No victim found, returning nil")
 	return nil
 }
 
 func listMetrics() (map[string]corev1.ResourceList, error) {
+	log.Log.V(1).Info("Inside listMetrics")
 	config, err := rest.InClusterConfig()
 	if err != nil {
+		log.Log.Error(err, "listMetrics: failed to get in-cluster config")
 		return nil, err
 	}
+	log.Log.V(1).Info("In-cluster config obtained")
 	mc, err := metrics.NewForConfig(config)
 	if err != nil {
+		log.Log.Error(err, "listMetrics: failed to create metrics client")
 		return nil, err
 	}
+	log.Log.V(1).Info("Metrics client created")
 
 	podMetricses, err := mc.MetricsV1beta1().PodMetricses(metav1.NamespaceDefault).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
+		log.Log.Error(err, "listMetrics: failed to list pod metrics")
 		return nil, err
 	}
+	log.Log.V(1).Info("Pod metrics listed", "metricCount", len(podMetricses.Items))
 
 	result := make(map[string]corev1.ResourceList)
+	log.Log.V(1).Info("Processing pod metrics")
 	for _, pod := range podMetricses.Items {
 		for _, container := range pod.Containers {
-			// We assume there is only one container for each pod
 			result[pod.Name] = container.Usage
+			log.Log.V(1).Info("Processed metrics for pod", "pod", pod.Name, "cpu", container.Usage.Cpu().String())
 		}
 	}
+	log.Log.V(1).Info("Finished processing pod metrics")
 	return result, nil
 }
 
@@ -449,15 +494,19 @@ func (r *McKubeReconciler) GetRealTimeData(ctx context.Context) (map[string]Real
 
 // This function obtains untyped resources, such as CRDs defined thrugh a yaml
 func (r *McKubeReconciler) GetResourcesDynamically(ctx context.Context, group string, version string, resource string, namespace string) ([]unstructured.Unstructured, error) {
+	log.Log.V(1).Info("Inside GetResourcesDynamically", "group", group, "version", version, "resource", resource, "namespace", namespace)
 	resourceId := schema.GroupVersionResource{
 		Group:    group,
 		Version:  version,
 		Resource: resource,
 	}
+	log.Log.V(1).Info("Fetching dynamic resource list", "resourceId", resourceId)
 	list, err := r.DynamicClient.Resource(resourceId).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		log.Log.Error(err, "GetResourcesDynamically: failed to list dynamic resource", "resourceId", resourceId)
 		return nil, err
 	}
+	log.Log.V(1).Info("Dynamic resource list obtained", "itemCount", len(list.Items))
 	return list.Items, nil
 }
 
@@ -518,11 +567,12 @@ func (r *McKubeReconciler) StartTaintThread() {
 							node.Spec.Taints[i] = node.Spec.Taints[len(node.Spec.Taints)-1]
 							// Update array without last element
 							node.Spec.Taints = node.Spec.Taints[:len(node.Spec.Taints)-1]
-						}
-						logger.V(0).Info("Taint Thread: untaining node", "node", nodeName)
-						err = r.Update(context.TODO(), node)
-						if err != nil {
-							logger.Error(err, "Taint Thread: error while un-tainting the node")
+							log.Log.V(0).Info("Taint Thread: untaining node", "node", nodeName)
+							err = r.Update(context.TODO(), node)
+							if err != nil {
+								logger.Error(err, "Taint Thread: error while un-tainting the node")
+							}
+							break
 						}
 					}
 					// We remove the entry about the tainted node because we removed the taint
@@ -550,19 +600,22 @@ func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // findObjectsForPod finds McKube objects for a given pod
 func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Object) []reconcile.Request {
+	// Pod가 default 네임스페이스인지 확인
 	if pod.GetNamespace() != "default" {
 		return []reconcile.Request{}
 	}
 
-	// Find McKube resources that might be affected by this pod
+	// Find McKube resources whose Spec.PodName matches the changed pod's name
 	mckubeList := &mcoperatorv1.McKubeList{}
-	if err := r.List(ctx, mckubeList, client.InNamespace("default")); err != nil {
+	// McKube 리소스는 Pod와 같은 네임스페이스(default)에 있다고 가정하고 해당 네임스페이스에서 조회
+	if err := r.List(ctx, mckubeList, client.InNamespace(pod.GetNamespace())); err != nil {
+		log.Log.Error(err, "Failed to list McKube resources in findObjectsForPod")
 		return []reconcile.Request{}
 	}
 
 	var requests []reconcile.Request
+	// McKube 리소스 목록을 순회하며 Spec.PodName이 현재 Pod의 이름과 일치하는지 확인
 	for _, mckube := range mckubeList.Items {
-		// Check if the pod name in McKube spec matches the changed pod's name
 		if mckube.Spec.PodName == pod.GetName() {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
@@ -570,7 +623,11 @@ func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Obj
 					Namespace: mckube.Namespace,
 				},
 			})
+			// 하나의 Pod는 하나의 McKube 리소스에만 연결된다고 가정하고 바로 반환
+			return requests
 		}
 	}
-	return requests
+
+	// default 네임스페이스의 Pod이지만, 해당 Pod를 Spec.PodName으로 가지는 McKube 리소스를 찾지 못한 경우
+	return []reconcile.Request{}
 }
