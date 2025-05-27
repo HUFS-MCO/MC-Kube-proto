@@ -43,6 +43,8 @@ import (
 
 	mcoperatorv1 "mc-kube/api/v1"
 	metrics "k8s.io/metrics/pkg/client/clientset/versioned"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // McKubeReconciler reconciles a McKube object
@@ -390,7 +392,7 @@ func (r *McKubeReconciler) GetRealTimeData(ctx context.Context) (map[string]Real
 	resultErr := make(map[string]RealTimeData)
 	result := make(map[string]RealTimeData)
 
-	items, err := r.GetResourcesDynamically(ctx, "mcoperator.sdv.com", "v1", "mckuberealtime", "default")
+	items, err := r.GetResourcesDynamically(ctx, "mcoperator.sdv.com", "v1", "mckuberealtimes", "default")
 	if err != nil {
 		log.Log.Error(err, "Failed to get McKubeRealtime resources")
 		return resultErr, err
@@ -532,12 +534,43 @@ func (r *McKubeReconciler) StartTaintThread() {
 				}
 			}
 		}
-	}()
+	}()	
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mcoperatorv1.McKube{}).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(r.findObjectsForPod)),
+		).
 		Complete(r)
+}
+
+// findObjectsForPod finds McKube objects for a given pod
+func (r *McKubeReconciler) findObjectsForPod(pod client.Object) []reconcile.Request {
+	if pod.GetNamespace() != "default" {
+		return []reconcile.Request{}
+	}
+
+	// Find McKube resources that might be affected by this pod
+	mckubeList := &mcoperatorv1.McKubeList{}
+	if err := r.List(context.Background(), mckubeList, client.InNamespace("default")); err != nil {
+		return []reconcile.Request{}
+	}
+
+	var requests []reconcile.Request
+	for _, mckube := range mckubeList.Items {
+		// Check if the pod name in McKube spec matches the changed pod's name
+		if mckube.Spec.PodName == pod.GetName() {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      mckube.Name,
+					Namespace: mckube.Namespace,
+				},
+			})
+		}
+	}
+	return requests
 }
