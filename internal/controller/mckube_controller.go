@@ -637,6 +637,14 @@ func (r *McKubeReconciler) StartTaintThread() {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Index Pods by their name to allow efficient lookup by name in Reconcile
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, ".metadata.name", func(rawObj client.Object) []string {
+		pod := rawObj.(*corev1.Pod)
+		return []string{pod.Name}
+	}); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mcoperatorv1.McKube{}).
 		Watches(
