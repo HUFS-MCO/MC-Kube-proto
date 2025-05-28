@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-rt-pod
+  namespace: default
+  labels:
+    sdv.com: test-rt-app
+spec:
+  containers:
+  - name: rt-test
+    image: ubuntu:latest
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      while true; do
+        # CPU intensive task to verify nice value effect
+        for i in {1..1000000}; do
+          echo $i > /dev/null
+        done
+        sleep 0.1
+      done
+    resources:
+      requests:
+        cpu: "1"
+        memory: "512Mi"
+      limits:
+        cpu: "2"
+        memory: "1Gi"
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKubeRealtime
+metadata:
+  name: test-rt-app
+  namespace: default
+spec:
+  criticality: "B"  # This will set nice value to -10
+  rtDeadline: 100
+  rtPeriod: 1000
+  rtWcets:
+  - node: ""  # Will be automatically filled after pod scheduling
+    rtWcet: 50
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: test-rt-pod-monitor
+  namespace: default
+spec:
+  podname: test-rt-pod
+  criticality: "B"  # This will set nice value to -10
+  node: ""
+  pressuredDeadlinesTotal: 0
+  pressuredDeadlinesPeriod: 0

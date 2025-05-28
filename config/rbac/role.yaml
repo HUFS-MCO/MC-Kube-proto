@@ -19,9 +19,9 @@ rules:
   - update
   - watch
 - apiGroups:
-  - mcoperator
+  - mcoperator.sdv.com
   resources:
-  - mckuberealtimes
+  - mckuberealtime
   verbs:
   - get
   - list
