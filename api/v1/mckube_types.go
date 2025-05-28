@@ -29,8 +29,9 @@ type McKubeSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// Foo is an example field of McKube. Edit mckube_types.go to remove/update
-	Node                  string `json:"node,omitempty"`
-	PodName               string `json:"podname,omitempty"`
+	Node                     string `json:"node,omitempty"`
+	PodName                  string `json:"podname,omitempty"`
+	Criticality              string `json:"criticality,omitempty"`
 	PressuredDeadlinesTotal  int    `json:"pressuredDeadlinesTotal,omitempty"`
 	PressuredDeadlinesPeriod int    `json:"pressuredDeadlinesPeriod,omitempty"`
 }

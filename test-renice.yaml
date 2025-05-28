@@ -47,6 +47,7 @@ metadata:
   namespace: default
 spec:
   podname: test-rt-pod
+  criticality: "B"  # This will set nice value to -10
   node: ""
   pressuredDeadlinesTotal: 0
   pressuredDeadlinesPeriod: 0

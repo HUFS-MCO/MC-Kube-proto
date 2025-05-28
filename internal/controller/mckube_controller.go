@@ -19,8 +19,8 @@ package controller
 import (
 	"bytes"
 	"context"
-	errorsGo "errors"
 	"encoding/json"
+	errorsGo "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	mcoperatorv1 "mc-kube/api/v1"
+
 	metrics "k8s.io/metrics/pkg/client/clientset/versioned"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -50,7 +51,7 @@ import (
 // McKubeReconciler reconciles a McKube object
 type McKubeReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme        *runtime.Scheme
 	DynamicClient dynamic.Interface
 }
 
@@ -269,59 +270,50 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Get the target pod
 	targetPod := &podList.Items[foundPod]
 
-	// Get node IP for renicer daemon
-	var nodeIP string
-	loggerLowPrio.Info("Fetching Node IP")
-	for _, addr := range foundNode.Status.Addresses {
-		if addr.Type == corev1.NodeInternalIP {
-			nodeIP = addr.Address
-			break
-		}
-	}
-
 	// Check if pod is newly created and set initial nice value
 	loggerLowPrio.Info("Checking pod phase and labels for renice eligibility")
 	if targetPod.Status.Phase == corev1.PodPending || targetPod.Status.Phase == corev1.PodRunning {
 		loggerHighPrio.Info("Checking pod for renice", "pod", targetPod.Name, "phase", targetPod.Status.Phase)
-		if appName, ok := targetPod.Labels["sdv.com"]; ok && appName != "" {
-			loggerHighPrio.Info("Found app label", "app", appName)
-			loggerLowPrio.Info("Fetching realtime data")
-			realTimeData, err := r.GetRealTimeData(ctx)
-			if err != nil {
-				logger.Error(err, "Failed to get realtime data")
-			} else {
-				if rtItem, ok := realTimeData[appName]; ok {
-					loggerHighPrio.Info("Found realtime data", "app", appName, "criticality", rtItem.Criticality)
-					var desiredNiceValue int
-					switch rtItem.Criticality {
-					case "A":
-						desiredNiceValue = 0
-					case "B":
-						desiredNiceValue = -10
-					case "C":
-						desiredNiceValue = -15
-					default:
-						desiredNiceValue = 0
-					}
+		// Check if McKube resource specifies a Criticality for this pod
+		if rt.Spec.Criticality != "" {
+			loggerHighPrio.Info("McKube resource specifies criticality", "criticality", rt.Spec.Criticality)
 
-					loggerLowPrio.Info("Determined desired nice value", "niceValue", desiredNiceValue)
+			var desiredNiceValue int
+			switch rt.Spec.Criticality {
+			case "A":
+				desiredNiceValue = 0
+			case "B":
+				desiredNiceValue = -10
+			case "C":
+				desiredNiceValue = -15
+			default:
+				desiredNiceValue = 0
+			}
 
-					if nodeIP != "" {
-						loggerHighPrio.Info("Sending renice request", "pod", targetPod.Name, "nodeIP", nodeIP, "niceValue", desiredNiceValue)
-						if err := r.sendReniceRequest(ctx, targetPod, nodeIP, desiredNiceValue); err != nil {
-							logger.Error(err, "Failed to send initial renice request", "pod", targetPod.Name, "nodeIP", nodeIP)
-						} else {
-							loggerHighPrio.Info("Successfully sent renice request", "pod", targetPod.Name)
-						}
-					} else {
-						logger.Error(nil, "Node IP is empty", "pod", targetPod.Name)
-					}
-				} else {
-					loggerHighPrio.Info("No realtime data found for app", "app", appName)
+			loggerLowPrio.Info("Determined desired nice value from McKube resource", "niceValue", desiredNiceValue)
+
+			// Get node IP for renicer daemon
+			var nodeIP string
+			loggerLowPrio.Info("Fetching Node IP")
+			for _, addr := range foundNode.Status.Addresses {
+				if addr.Type == corev1.NodeInternalIP {
+					nodeIP = addr.Address
+					break
 				}
 			}
+
+			if nodeIP != "" {
+				loggerHighPrio.Info("Sending renice request", "pod", targetPod.Name, "nodeIP", nodeIP, "niceValue", desiredNiceValue)
+				if err := r.sendReniceRequest(ctx, targetPod, nodeIP, desiredNiceValue); err != nil {
+					logger.Error(err, "Failed to send initial renice request", "pod", targetPod.Name, "nodeIP", nodeIP)
+				} else {
+					loggerHighPrio.Info("Successfully sent renice request", "pod", targetPod.Name)
+				}
+			} else {
+				logger.Error(nil, "Node IP is empty", "pod", targetPod.Name)
+			}
 		} else {
-			loggerHighPrio.Info("No app label found on pod", "pod", targetPod.Name)
+			loggerHighPrio.Info("McKube resource has no criticality specified for renice", "pod", targetPod.Name)
 		}
 	} else {
 		loggerLowPrio.Info("Pod not in Pending or Running phase, skipping renice check", "pod", targetPod.Name, "phase", targetPod.Status.Phase)
@@ -632,7 +624,7 @@ func (r *McKubeReconciler) StartTaintThread() {
 				}
 			}
 		}
-	}()	
+	}()
 }
 
 // SetupWithManager sets up the controller with the Manager.
