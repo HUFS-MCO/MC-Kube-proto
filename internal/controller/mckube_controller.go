@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -146,6 +147,40 @@ func (r *McKubeReconciler) sendReniceRequest(ctx context.Context, pod *corev1.Po
 	}
 
 	logger.V(0).Info("Successfully sent renice request")
+	return nil
+}
+
+// kubectl patch pod <pod> --type=json --subresource=resize -p='[{"op":"replace","path":"/spec/containers/0/resources/requests/cpu","value":"<cpu>"}]' 와 동일 역할
+func (r *McKubeReconciler) PatchPodResizeCPU(ctx context.Context, namespace string, podName string, desiredCPU string) error {
+	logger := log.Log.WithValues("McKube/rt", "PatchPodResizeCPU", "pod", fmt.Sprintf("%s/%s", namespace, podName))
+	patch := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/spec/containers/0/resources/requests/cpu",
+			"value": desiredCPU,
+		},
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		logger.Error(err, "Failed to marshal JSON patch for resize")
+		return err
+	}
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		logger.Error(err, "Failed to get in-cluster config")
+		return err
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		logger.Error(err, "Failed to create Kubernetes clientset")
+		return err
+	}
+	_, err = clientset.CoreV1().Pods(namespace).Patch(ctx, podName, types.JSONPatchType, patchBytes, metav1.PatchOptions{}, "resize")
+	if err != nil {
+		logger.Error(err, "Failed to patch pod resize")
+		return err
+	}
+	logger.V(0).Info("Successfully patched pod resize", "cpuRequest", desiredCPU)
 	return nil
 }
 
