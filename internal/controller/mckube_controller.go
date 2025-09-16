@@ -81,6 +81,7 @@ const (
 // Taint key (kept for compatibility, not required for eviction fast-path)
 const rtPressureTaintKey = "McKubeRTDeadlinePressure"
 
+// +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups=mcoperator.sdv.com,resources=mckuberealtimes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=mcoperator.sdv.com,resources=mckubes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=mcoperator.sdv.com,resources=mckubes/status,verbs=get;update;patch

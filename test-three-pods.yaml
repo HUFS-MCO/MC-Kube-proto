@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-rt-pod-a
+  namespace: default
+  labels:
+    sdv.com: test-rt-app-a
+spec:
+  containers:
+  - name: rt-test
+    image: noru0817/kotaekyu:0.0.1
+    command: ["stress-ng"]
+    args:
+    - "--cpu"
+    - "2"         # CPU 워커 16개를 사용
+    - "--timeout"
+    - "0"         # 무한정 실행
+    resources:
+      requests:
+        cpu: "1000m"
+      limits:
+        cpu: "16000m"
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKubeRealtime
+metadata:
+  name: test-rt-app-a
+  namespace: default
+spec:
+  criticality: "A"
+  rtDeadline: 100
+  rtPeriod: 1000
+  rtWcets:
+  - node: ""  # Will be automatically filled after pod scheduling
+    rtWcet: 50
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: test-rt-pod-monitor-a
+  namespace: default
+spec:
+  podname: test-rt-pod-a 
+  criticality: "A"
+  node: ""
+  pressuredDeadlinesTotal: 0
+  pressuredDeadlinesPeriod: 0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-rt-pod-b
+  namespace: default
+  labels:
+    sdv.com: test-rt-app-b
+spec:
+  containers:
+  - name: rt-test
+    image: noru0817/kotaekyu:0.0.1
+    command: ["stress-ng"]
+    args:
+    - "--cpu"
+    - "6"         # CPU 워커 16개를 사용
+    - "--timeout"
+    - "0"         # 무한정 실행
+    resources:
+      requests:
+        cpu: "1000m"
+      limits:
+        cpu: "16000m"
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKubeRealtime
+metadata:
+  name: test-rt-app-b
+  namespace: default
+spec:
+  criticality: "B"
+  rtDeadline: 100
+  rtPeriod: 1000
+  rtWcets:
+  - node: ""  # Will be automatically filled after pod scheduling
+    rtWcet: 50
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: test-rt-pod-monitor-b
+  namespace: default
+spec:
+  podname: test-rt-pod-b 
+  node: ""
+  pressuredDeadlinesTotal: 0
+  pressuredDeadlinesPeriod: 0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-rt-pod-c
+  namespace: default
+  labels:
+    sdv.com: test-rt-app-c
+spec:
+  containers:
+  - name: rt-test
+    image: noru0817/kotaekyu:0.0.1
+    command: ["stress-ng"]
+    args:
+    - "--cpu"
+    - "8"         # CPU 워커 16개를 사용
+    - "--timeout"
+    - "0"         # 무한정 실행
+    resources:
+      requests:
+        cpu: "1000m"
+      limits:
+        cpu: "16000m"
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKubeRealtime
+metadata:
+  name: test-rt-app-c
+  namespace: default
+spec:
+  criticality: "C"
+  rtDeadline: 100
+  rtPeriod: 1000
+  rtWcets:
+  - node: ""  # Will be automatically filled after pod scheduling
+    rtWcet: 50
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: test-rt-pod-monitor-c
+  namespace: default
+spec:
+  podname: test-rt-pod-c
+  node: ""
+  pressuredDeadlinesTotal: 0
+  pressuredDeadlinesPeriod: 0
