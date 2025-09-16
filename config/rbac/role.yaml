@@ -7,11 +7,25 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods/resize
+  verbs:
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
   - nodes
-  - nodes/status
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
-  - create
   - delete
   - get
   - list
@@ -19,12 +33,22 @@ rules:
   - update
   - watch
 - apiGroups:
-  - mcoperator.sdv.com
+  - ""
   resources:
-  - mckuberealtime
+  - pods/status
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - mcoperator.sdv.com
+  resources:
+  - mckuberealtime
+  - mckuberealtimes
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - mcoperator.sdv.com
   resources:
@@ -52,10 +76,8 @@ rules:
   - patch
   - update
 - apiGroups:
-  - metrics.k8s.io
+  - policy
   resources:
-  - pods
+  - pods/eviction
   verbs:
-  - get
-  - list
-  - watch
+  - create

@@ -39,6 +39,8 @@ spec:
           spec:
             description: McKubeSpec defines the desired state of McKube
             properties:
+              criticality:
+                type: string
               node:
                 description: Foo is an example field of McKube. Edit mckube_types.go
                   to remove/update
