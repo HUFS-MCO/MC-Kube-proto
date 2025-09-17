@@ -40,6 +40,10 @@ patches:
 - path: manager_metrics_patch.yaml
   target:
     kind: Deployment
+# [IMAGEPULLPOLICY] Always pull the latest image
+- path: manager_imagepullpolicy_patch.yaml
+  target:
+    kind: Deployment
 
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
