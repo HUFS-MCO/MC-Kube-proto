@@ -34,16 +34,16 @@ type McKubeSpec struct {
 	Criticality              string `json:"criticality,omitempty"`
 	PressuredDeadlinesTotal  int    `json:"pressuredDeadlinesTotal,omitempty"`
 	PressuredDeadlinesPeriod int    `json:"pressuredDeadlinesPeriod,omitempty"`
-	
+
 	// RT Cgroup settings
 	RTSettings *RTSettings `json:"rtSettings,omitempty"`
 }
 
 // RTSettings defines RT cgroup configuration
 type RTSettings struct {
-	Period  int     `json:"period"`           // RT period in microseconds
-	Runtime int     `json:"runtime"`          // RT runtime in microseconds
-	Core    *string `json:"core,omitempty"`   // CPU core range (e.g., "2-3")
+	Period  int     `json:"period"`         // RT period in microseconds
+	Runtime int     `json:"runtime"`        // RT runtime in microseconds
+	Core    *string `json:"core,omitempty"` // CPU core range (e.g., "2-3")
 }
 
 // McKubeStatus defines the observed state of McKube

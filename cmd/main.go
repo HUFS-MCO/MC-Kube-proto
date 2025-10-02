@@ -74,7 +74,7 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
 		Development: true,
-		Level: zapcore.Level(0),
+		Level:       zapcore.Level(0),
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -149,10 +149,10 @@ func main() {
 	}
 
 	reconciler := &controller.McKubeReconciler{
-        Client: mgr.GetClient(),
-        Scheme: mgr.GetScheme(),
-        DynamicClient: dynamic.NewForConfigOrDie(mgr.GetConfig()),
-    }
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		DynamicClient: dynamic.NewForConfigOrDie(mgr.GetConfig()),
+	}
 
 	if err = reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "McKube")
@@ -178,7 +178,7 @@ func main() {
 	}
 
 	setupLog.Info("starting thread for taint timeout McKube")
-    reconciler.StartTaintThread()
+	reconciler.StartTaintThread()
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

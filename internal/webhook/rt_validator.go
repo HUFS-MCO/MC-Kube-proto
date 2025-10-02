@@ -6,10 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
-	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -33,8 +32,8 @@ type CgroupRequest struct {
 
 func (v *RTValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	pod := &corev1.Pod{}
-	
-	err := v.decoder.Decode(req, pod)
+
+	err := (*v.decoder).Decode(req, pod)
 	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
@@ -74,7 +73,7 @@ func (v *RTValidator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod)
 
 func (v *RTValidator) applyRTSettingsAsync(ctx context.Context, pod *corev1.Pod, rtSettings *mcoperatorv1.RTSettings, mckube *mcoperatorv1.McKube) {
 	logger := log.Log.WithValues("pod", pod.Name, "namespace", pod.Namespace)
-	
+
 	// Wait for pod to be scheduled and containers to be created
 	for i := 0; i < 60; i++ { // Wait up to 60 seconds
 		currentPod := &corev1.Pod{}
@@ -163,7 +162,7 @@ func (v *RTValidator) markRTApplied(ctx context.Context, mckube *mcoperatorv1.Mc
 		mckube.Annotations = make(map[string]string)
 	}
 	mckube.Annotations["mckube.io/rt-applied"] = "true"
-	
+
 	return v.Client.Update(ctx, mckube)
 }
 

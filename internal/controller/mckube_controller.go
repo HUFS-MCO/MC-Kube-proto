@@ -186,7 +186,7 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Apply RT settings if specified
 	if rt.Spec.RTSettings != nil {
 		loggerHighPrio.Info("Checking if RT settings need to be applied", "podName", rt.Spec.PodName)
-		
+
 		// Get the pod first to check its current state
 		pod := &corev1.Pod{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err != nil {
@@ -197,7 +197,7 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			logger.Error(err, "Failed to get target pod for RT settings")
 			return ctrl.Result{}, err
 		}
-		
+
 		// Apply RT settings based on pod phase
 		switch pod.Status.Phase {
 		case corev1.PodPending:
@@ -235,7 +235,7 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 					return ctrl.Result{RequeueAfter: time.Second * 10}, err
 				}
 				loggerHighPrio.Info("RT settings applied to running pod")
-				
+
 				// Mark as applied
 				if err := r.markRTSettingsApplied(ctx, pod); err != nil {
 					logger.Error(err, "Failed to mark RT settings as applied")
@@ -875,7 +875,7 @@ func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Obj
 
 func (r *McKubeReconciler) applyRTSettings(ctx context.Context, rt *mcoperatorv1.McKube) error {
 	logger := log.Log.WithValues("McKube/rt", rt.Name)
-	
+
 	// Get the target pod
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err != nil {
@@ -893,7 +893,7 @@ func (r *McKubeReconciler) applyRTSettings(ctx context.Context, rt *mcoperatorv1
 		if len(pod.Status.ContainerStatuses) == 0 {
 			return fmt.Errorf("pod %s containers not yet created", rt.Spec.PodName)
 		}
-		
+
 		// Check if any container doesn't have an ID yet
 		for _, containerStatus := range pod.Status.ContainerStatuses {
 			if containerStatus.ContainerID == "" {
@@ -937,7 +937,7 @@ func (r *McKubeReconciler) markRTSettingsApplied(ctx context.Context, pod *corev
 		pod.Annotations = make(map[string]string)
 	}
 	pod.Annotations["mckube.io/rt-applied"] = "true"
-	
+
 	return r.Update(ctx, pod)
 }
 

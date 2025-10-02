@@ -9,8 +9,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -27,8 +25,8 @@ type PodMutator struct {
 
 func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	pod := &corev1.Pod{}
-	
-	err := m.decoder.Decode(req, pod)
+
+	err := (*m.decoder).Decode(req, pod)
 	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
@@ -85,13 +83,13 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 	// Wait for pod to be scheduled and containers to be created
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	
+
 	timeout := time.After(5 * time.Minute) // 5 minute timeout
-	
+
 	for {
 		select {
 		case <-timeout:
-			log.Log.Error(fmt.Errorf("timeout waiting for pod to be ready"), 
+			log.Log.Error(fmt.Errorf("timeout waiting for pod to be ready"),
 				"Pod RT configuration timeout", "pod", pod.Name, "namespace", pod.Namespace)
 			return
 		case <-ticker.C:
@@ -150,14 +148,14 @@ func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.P
 
 	// Call rt-daemon on the node
 	daemonURL := fmt.Sprintf("http://%s:8080/cgroup", nodeIP)
-	
+
 	requestBody := map[string]interface{}{
-		"pod_name":   pod.Name,
-		"namespace":  pod.Namespace,
-		"period":     rtSettings.Period,
-		"runtime":    rtSettings.Runtime,
+		"pod_name":  pod.Name,
+		"namespace": pod.Namespace,
+		"period":    rtSettings.Period,
+		"runtime":   rtSettings.Runtime,
 	}
-	
+
 	if rtSettings.Core != nil {
 		requestBody["core"] = *rtSettings.Core
 	}
@@ -177,12 +175,12 @@ func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.P
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Log.Error(fmt.Errorf("rt-daemon returned non-200 status"), 
+		log.Log.Error(fmt.Errorf("rt-daemon returned non-200 status"),
 			"RT daemon error", "status", resp.StatusCode, "url", daemonURL)
 		return false
 	}
 
-	log.Log.Info("RT settings applied successfully", 
+	log.Log.Info("RT settings applied successfully",
 		"pod", pod.Name, "namespace", pod.Namespace, "node", pod.Spec.NodeName)
 	return true
 }
@@ -193,7 +191,7 @@ func (m *PodMutator) updatePodRTAnnotation(ctx context.Context, pod *corev1.Pod,
 		pod.Annotations = make(map[string]string)
 	}
 	pod.Annotations[key] = value
-	
+
 	err := m.client.Patch(ctx, pod, patch)
 	if err != nil {
 		log.Log.Error(err, "Failed to update pod annotation", "key", key, "value", value)
