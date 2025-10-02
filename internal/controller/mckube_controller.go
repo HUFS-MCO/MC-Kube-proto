@@ -3,10 +3,12 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +51,14 @@ type RealTimeData struct {
 	RTDeadline  int
 	RTPeriod    int
 	RTWcets     []RealTimeWCET
+}
+
+// CgroupRequest for RT daemon communication
+type CgroupRequest struct {
+	ContainerID string  `json:"container_id"`
+	Period      int     `json:"period"`
+	Runtime     int     `json:"runtime"`
+	Core        *string `json:"core,omitempty"`
 }
 
 // Timers map: key=node name, value=remaining ticks before removing the taint.
@@ -171,6 +181,69 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		loggerHighPrio.Info("McKube resource updated with Node name. Requeuing to process...")
 		return ctrl.Result{RequeueAfter: time.Second * 1}, nil
+	}
+
+	// Apply RT settings if specified
+	if rt.Spec.RTSettings != nil {
+		loggerHighPrio.Info("Checking if RT settings need to be applied", "podName", rt.Spec.PodName)
+		
+		// Get the pod first to check its current state
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err != nil {
+			if client.IgnoreNotFound(err) == nil {
+				loggerLowPrio.Info("Target pod not found yet. Will apply RT settings when pod is created.")
+				return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+			}
+			logger.Error(err, "Failed to get target pod for RT settings")
+			return ctrl.Result{}, err
+		}
+		
+		// Apply RT settings based on pod phase
+		switch pod.Status.Phase {
+		case corev1.PodPending:
+			// Check if containers are created but not started yet
+			if len(pod.Status.ContainerStatuses) > 0 {
+				allHaveIDs := true
+				for _, cs := range pod.Status.ContainerStatuses {
+					if cs.ContainerID == "" {
+						allHaveIDs = false
+						break
+					}
+				}
+				if allHaveIDs {
+					loggerHighPrio.Info("Containers created but not running - applying RT settings", "podName", rt.Spec.PodName)
+					if err := r.applyRTSettings(ctx, rt); err != nil {
+						logger.Error(err, "Failed to apply RT settings during pending phase")
+						return ctrl.Result{RequeueAfter: time.Second * 5}, err
+					}
+					loggerHighPrio.Info("RT settings applied successfully during pending phase")
+				} else {
+					loggerLowPrio.Info("Containers not yet created. Requeuing...", "podName", rt.Spec.PodName)
+					return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+				}
+			} else {
+				loggerLowPrio.Info("Pod pending but no container statuses yet. Requeuing...", "podName", rt.Spec.PodName)
+				return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+			}
+		case corev1.PodRunning:
+			// For running pods, check if RT settings have been applied
+			// We could add an annotation to track this
+			if pod.Annotations == nil || pod.Annotations["mckube.io/rt-applied"] != "true" {
+				loggerHighPrio.Info("Pod running but RT settings not applied yet", "podName", rt.Spec.PodName)
+				if err := r.applyRTSettings(ctx, rt); err != nil {
+					logger.Error(err, "Failed to apply RT settings to running pod")
+					return ctrl.Result{RequeueAfter: time.Second * 10}, err
+				}
+				loggerHighPrio.Info("RT settings applied to running pod")
+				
+				// Mark as applied
+				if err := r.markRTSettingsApplied(ctx, pod); err != nil {
+					logger.Error(err, "Failed to mark RT settings as applied")
+				}
+			}
+		default:
+			loggerLowPrio.Info("Pod in non-applicable phase for RT settings", "phase", pod.Status.Phase)
+		}
 	}
 
 	loggerLowPrio.Info("Reconcile method finished")
@@ -796,4 +869,94 @@ func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Obj
 		}
 	}
 	return []reconcile.Request{}
+}
+
+// ===================== RT Settings Functions =====================
+
+func (r *McKubeReconciler) applyRTSettings(ctx context.Context, rt *mcoperatorv1.McKube) error {
+	logger := log.Log.WithValues("McKube/rt", rt.Name)
+	
+	// Get the target pod
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err != nil {
+		return fmt.Errorf("failed to get target pod %s: %v", rt.Spec.PodName, err)
+	}
+
+	// Check if pod has containers created (but may not be running yet)
+	if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodPending {
+		return fmt.Errorf("pod %s is not in a valid state for RT configuration: %s", rt.Spec.PodName, pod.Status.Phase)
+	}
+
+	// For pending pods, wait until containers are created
+	if pod.Status.Phase == corev1.PodPending {
+		// Check if containers are created but not yet running
+		if len(pod.Status.ContainerStatuses) == 0 {
+			return fmt.Errorf("pod %s containers not yet created", rt.Spec.PodName)
+		}
+		
+		// Check if any container doesn't have an ID yet
+		for _, containerStatus := range pod.Status.ContainerStatuses {
+			if containerStatus.ContainerID == "" {
+				return fmt.Errorf("pod %s containers not fully created yet", rt.Spec.PodName)
+			}
+		}
+	}
+
+	// Get node IP
+	nodeIP := pod.Status.HostIP
+	if nodeIP == "" {
+		return fmt.Errorf("node IP not available for pod %s", rt.Spec.PodName)
+	}
+
+	// Apply RT settings to each container
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.ContainerID == "" {
+			continue
+		}
+
+		req := CgroupRequest{
+			ContainerID: containerStatus.ContainerID,
+			Period:      rt.Spec.RTSettings.Period,
+			Runtime:     rt.Spec.RTSettings.Runtime,
+			Core:        rt.Spec.RTSettings.Core,
+		}
+
+		if err := r.sendRTRequest(nodeIP, req); err != nil {
+			logger.Error(err, "Failed to apply RT settings to container", "containerID", containerStatus.ContainerID)
+			return err
+		}
+
+		logger.Info("Successfully applied RT settings to container", "containerID", containerStatus.ContainerID)
+	}
+
+	return nil
+}
+
+func (r *McKubeReconciler) markRTSettingsApplied(ctx context.Context, pod *corev1.Pod) error {
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations["mckube.io/rt-applied"] = "true"
+	
+	return r.Update(ctx, pod)
+}
+
+func (r *McKubeReconciler) sendRTRequest(nodeIP string, req CgroupRequest) error {
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	url := fmt.Sprintf("http://%s:8080/cgroup", nodeIP)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to send request to %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("RT daemon request failed with status: %d", resp.StatusCode)
+	}
+
+	return nil
 }

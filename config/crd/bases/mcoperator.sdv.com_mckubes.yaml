@@ -51,6 +51,22 @@ spec:
                 type: integer
               pressuredDeadlinesTotal:
                 type: integer
+              rtSettings:
+                description: RTSettings defines RT cgroup configuration
+                properties:
+                  core:
+                    description: CPU core range (e.g., :"2" or "2-3")
+                    type: string
+                  period:
+                    description: RT period in microseconds
+                    type: integer
+                  runtime:
+                    description: RT runtime in microseconds
+                    type: integer
+                required:
+                - period
+                - runtime
+                type: object
             type: object
           status:
             description: McKubeStatus defines the observed state of McKube
