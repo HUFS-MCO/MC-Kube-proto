@@ -19,17 +19,35 @@ import (
 // +kubebuilder:webhook:path=/mutate-v1-pod,mutating=true,failurePolicy=fail,sideEffects=NoneOnDryRun,groups="",resources=pods,verbs=create,versions=v1,name=mpod.kb.io,admissionReviewVersions=v1
 
 type PodMutator struct {
-	client  client.Client
-	decoder *admission.Decoder
+	client client.Client
 }
 
 func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	log.Log.Info("=== Webhook Handle called ===", "pod.name", req.Name, "pod.namespace", req.Namespace)
+	
+	// Check if receiver m is nil
+	if m == nil {
+		log.Log.Error(fmt.Errorf("PodMutator receiver is nil"), "PodMutator receiver (m) is nil")
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("internal error: PodMutator receiver is nil"))
+	}
+	log.Log.Info("PodMutator receiver is not nil", "mutator", m)
+	
+	// Nil check for client
+	if m.client == nil {
+		log.Log.Error(fmt.Errorf("client is nil"), "PodMutator client is nil")
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("internal error: client is nil"))
+	}
+	log.Log.Info("Client is not nil", "client", m.client)
+	
 	pod := &corev1.Pod{}
 
-	err := (*m.decoder).Decode(req, pod)
+	err := json.Unmarshal(req.Object.Raw, pod)
 	if err != nil {
+		log.Log.Error(err, "Failed to unmarshal pod")
 		return admission.Errored(http.StatusBadRequest, err)
 	}
+
+	log.Log.Info("Pod unmarshaled successfully", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
 
 	// Check if there's a matching McKube resource with RT settings
 	rtSettings, err := m.findRTSettingsForPod(ctx, pod)
@@ -38,7 +56,10 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Allowed("No RT settings found")
 	}
 
+	log.Log.Info("RT settings found", "rtSettings", rtSettings)
+
 	if rtSettings == nil {
+		log.Log.Info("No RT settings configured")
 		return admission.Allowed("No RT settings configured")
 	}
 
@@ -65,17 +86,33 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 }
 
 func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) (*mcoperatorv1.RTSettings, error) {
+	if m.client == nil {
+		return nil, fmt.Errorf("client is nil")
+	}
+	
+	if pod == nil {
+		return nil, fmt.Errorf("pod is nil")
+	}
+	
+	log.Log.Info("Finding RT settings for pod", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
+	
 	mckubeList := &mcoperatorv1.McKubeList{}
 	if err := m.client.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
+		log.Log.Error(err, "Failed to list McKube resources")
 		return nil, err
 	}
 
-	for _, mckube := range mckubeList.Items {
+	log.Log.Info("Found McKube resources", "count", len(mckubeList.Items))
+
+	for i, mckube := range mckubeList.Items {
+		log.Log.Info("Checking McKube resource", "index", i, "name", mckube.Name, "podName", mckube.Spec.PodName, "targetPod", pod.Name)
 		if mckube.Spec.PodName == pod.Name && mckube.Spec.RTSettings != nil {
+			log.Log.Info("Found matching RT settings", "mckube.name", mckube.Name)
 			return mckube.Spec.RTSettings, nil
 		}
 	}
 
+	log.Log.Info("No matching RT settings found for pod", "pod.name", pod.Name)
 	return nil, nil
 }
 
@@ -196,11 +233,6 @@ func (m *PodMutator) updatePodRTAnnotation(ctx context.Context, pod *corev1.Pod,
 	if err != nil {
 		log.Log.Error(err, "Failed to update pod annotation", "key", key, "value", value)
 	}
-}
-
-func (m *PodMutator) InjectDecoder(d *admission.Decoder) error {
-	m.decoder = d
-	return nil
 }
 
 func NewPodMutator(client client.Client) *PodMutator {

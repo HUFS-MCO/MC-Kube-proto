@@ -19,8 +19,7 @@ import (
 // +kubebuilder:webhook:path=/validate-rt-pod,mutating=false,failurePolicy=fail,sideEffects=NoneOnDryRun,groups="",resources=pods,verbs=create,versions=v1,name=vrtpod.kb.io,admissionReviewVersions=v1
 
 type RTValidator struct {
-	Client  client.Client
-	decoder *admission.Decoder
+	Client client.Client
 }
 
 type CgroupRequest struct {
@@ -33,7 +32,7 @@ type CgroupRequest struct {
 func (v *RTValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	pod := &corev1.Pod{}
 
-	err := (*v.decoder).Decode(req, pod)
+	err := json.Unmarshal(req.Object.Raw, pod)
 	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
@@ -166,7 +165,3 @@ func (v *RTValidator) markRTApplied(ctx context.Context, mckube *mcoperatorv1.Mc
 	return v.Client.Update(ctx, mckube)
 }
 
-func (v *RTValidator) InjectDecoder(d *admission.Decoder) error {
-	v.decoder = d
-	return nil
-}

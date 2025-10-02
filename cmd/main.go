@@ -161,7 +161,13 @@ func main() {
 
 	// Setup webhook
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		setupLog.Info("Creating PodMutator instance")
 		podMutator := mcwebhook.NewPodMutator(mgr.GetClient())
+		if podMutator == nil {
+			setupLog.Error(nil, "PodMutator instance is nil!")
+			os.Exit(1)
+		}
+		setupLog.Info("PodMutator created successfully", "mutator", podMutator)
 		mgr.GetWebhookServer().Register("/mutate-v1-pod", &webhook.Admission{Handler: podMutator})
 		setupLog.Info("webhook registered", "path", "/mutate-v1-pod")
 	}
