@@ -9,7 +9,7 @@ metadata:
     app.kubernetes.io/name: service
     app.kubernetes.io/part-of: mc-kube
   name: webhook-service
-  namespace: system
+  namespace: mc-kube-system
 spec:
   ports:
   - name: webhook-server

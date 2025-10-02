@@ -29,8 +29,6 @@ spec:
   dnsNames:
   - mc-kube-webhook-service.mc-kube-system.svc
   - mc-kube-webhook-service.mc-kube-system.svc.cluster.local
-  - webhook-service.system.svc
-  - webhook-service.system.svc.cluster.local
   issuerRef:
     kind: Issuer
     name: selfsigned-issuer
