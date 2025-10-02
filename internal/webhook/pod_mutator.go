@@ -15,7 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	mcv1alpha1 "github.com/HUFS-MCO/MC-Kube-proto/api/v1alpha1"
+	mcoperatorv1 "mc-kube/api/v1"
 )
 
 // +kubebuilder:webhook:path=/mutate-v1-pod,mutating=true,failurePolicy=fail,sideEffects=NoneOnDryRun,groups="",resources=pods,verbs=create,versions=v1,name=mpod.kb.io,admissionReviewVersions=v1
@@ -66,8 +66,8 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 }
 
-func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) (*mcv1alpha1.RTSettings, error) {
-	mckubeList := &mcv1alpha1.McKubeList{}
+func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) (*mcoperatorv1.RTSettings, error) {
+	mckubeList := &mcoperatorv1.McKubeList{}
 	if err := m.client.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
 		return nil, err
 	}
@@ -81,7 +81,7 @@ func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) 
 	return nil, nil
 }
 
-func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Pod, rtSettings *mcv1alpha1.RTSettings) {
+func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Pod, rtSettings *mcoperatorv1.RTSettings) {
 	// Wait for pod to be scheduled and containers to be created
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -126,7 +126,7 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 	}
 }
 
-func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.Pod, rtSettings *mcv1alpha1.RTSettings) bool {
+func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.Pod, rtSettings *mcoperatorv1.RTSettings) bool {
 	// Get the node's IP where the pod is running
 	node := &corev1.Node{}
 	err := m.client.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, node)

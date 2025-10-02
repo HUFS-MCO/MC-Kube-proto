@@ -52,16 +52,13 @@ spec:
               pressuredDeadlinesTotal:
                 type: integer
               rtSettings:
-                description: RTSettings defines RT cgroup configuration
+                description: RT Cgroup settings
                 properties:
                   core:
-                    description: CPU core range (e.g., :"2" or "2-3")
                     type: string
                   period:
-                    description: RT period in microseconds
                     type: integer
                   runtime:
-                    description: RT runtime in microseconds
                     type: integer
                 required:
                 - period
