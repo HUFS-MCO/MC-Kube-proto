@@ -1,0 +1,10 @@
+nameReference:
+- kind: Certificate
+  group: cert-manager.io
+  fieldSpecs:
+  - kind: MutatingWebhookConfiguration
+    group: admissionregistration.k8s.io
+    path: metadata/annotations/cert-manager.io\/inject-ca-from
+  - kind: ValidatingWebhookConfiguration
+    group: admissionregistration.k8s.io
+    path: metadata/annotations/cert-manager.io\/inject-ca-from

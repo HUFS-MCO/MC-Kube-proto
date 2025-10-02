@@ -1,0 +1,37 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  labels:
+    app.kubernetes.io/component: certificate
+    app.kubernetes.io/created-by: mc-kube
+    app.kubernetes.io/instance: selfsigned-issuer
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: issuer
+    app.kubernetes.io/part-of: mc-kube
+  name: selfsigned-issuer
+  namespace: mc-kube-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/component: certificate
+    app.kubernetes.io/created-by: mc-kube
+    app.kubernetes.io/instance: serving-cert
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: certificate
+    app.kubernetes.io/part-of: mc-kube
+  name: serving-cert
+  namespace: mc-kube-system
+spec:
+  dnsNames:
+  - mc-kube-webhook-service.mc-kube-system.svc
+  - mc-kube-webhook-service.mc-kube-system.svc.cluster.local
+  - webhook-service.system.svc
+  - webhook-service.system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: selfsigned-issuer
+  secretName: webhook-server-cert
