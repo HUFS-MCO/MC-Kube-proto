@@ -3,10 +3,12 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +51,15 @@ type RealTimeData struct {
 	RTDeadline  int
 	RTPeriod    int
 	RTWcets     []RealTimeWCET
+}
+
+type CgroupSpec struct {
+	// 마이크로초 단위. >0 이어야 함
+	Period int `json:"period"`
+	// 마이크로초 단위. <0 이면 unlimited 의미, 0<=runtime<=period
+	Runtime int `json:"runtime"`
+	// 옵션. 비어있으면 첫 번째 컨테이너로 처리
+	ContainerName string `json:"containerName,omitempty"`
 }
 
 // Timers map: key=node name, value=remaining ticks before removing the taint.
@@ -172,9 +183,6 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		loggerHighPrio.Info("McKube resource updated with Node name. Requeuing to process...")
 		return ctrl.Result{RequeueAfter: time.Second * 1}, nil
 	}
-
-	loggerLowPrio.Info("Reconcile method finished")
-	return ctrl.Result{}, nil
 }
 
 // ===================== Data collection (CPU utilization, over90 duration) =====================
@@ -202,7 +210,7 @@ func (r *McKubeReconciler) getNodeOver90Seconds(ctx context.Context, node *corev
 	if ann == nil {
 		return 0, fmt.Errorf("node %s has no annotations", node.Name)
 	}
-	v := strings.TrimSpace(ann[annDurKey]) // main.go와 정합!
+	v := strings.TrimSpace(ann[annDurKey])
 	if v == "" {
 		return 0, nil
 	}
@@ -429,221 +437,285 @@ func hasActionableInTier(pods []*corev1.Pod, rtData map[string]RealTimeData, tie
 	return true
 }
 
+// ===================== Event-driven adaptive control =====================
+
+// handleNodeCPUPressure processes a node when CPU pressure is detected
+func (r *McKubeReconciler) handleNodeCPUPressure(ctx context.Context, nodeName string) {
+    logger := log.Log.WithValues("McKube/rt.AdaptiveControlLoop", "CPU>90%", "node", nodeName)
+    
+    node := &corev1.Node{}
+    if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+        logger.Error(err, "Failed to get node")
+        return
+    }
+
+    pct, err := r.getNodeCPUPercent(ctx, node)
+    if err != nil {
+        logger.V(1).Info("Failed to get node CPU percent (annotation)", "err", err.Error())
+        return
+    }
+
+    // CPU가 90% 미만이면 상태 리셋
+    if pct <= cpuThresholdPercent {
+        if _, exists := pressureState[nodeName]; exists {
+            logger.V(0).Info("Node CPU below threshold: resetting pressure state",
+                "cpu(%)", fmt.Sprintf("%.1f", pct))
+            delete(pressureState, nodeName)
+        }
+        return
+    }
+
+    // Get RT data
+    rtData, err := r.GetRealTimeData(ctx)
+    if err != nil {
+        logger.Error(err, "Failed to get RT data")
+        return
+    }
+
+    // Get pods on this node
+    podList := &corev1.PodList{}
+    if err := r.List(ctx, podList, client.InNamespace(targetNamespace)); err != nil {
+        logger.Error(err, "Failed to list pods", "namespace", targetNamespace)
+        return
+    }
+
+    var nodePods []*corev1.Pod
+    for i := range podList.Items {
+        p := &podList.Items[i]
+        if p.Spec.NodeName == nodeName {
+            nodePods = append(nodePods, p)
+        }
+    }
+
+    if len(nodePods) == 0 {
+        return
+    }
+
+    overSec, err := r.getNodeOver90Seconds(ctx, node)
+    if err != nil {
+        logger.V(1).Info("Failed to get over90 duration; treating as 0", "err", err.Error())
+        overSec = 0
+    }
+
+    podMilli, err := r.listPodMilliCPUByNode(ctx, targetNamespace, node)
+    if err != nil {
+        logger.Error(err, "Failed to list pod milliCPU (requests-based)")
+        return
+    }
+
+    // 해당 노드의 상태를 저장할 객체 생성
+    state := pressureState[nodeName]
+    if state == nil {
+        state = &NodePressureState{
+            AboveSec:       0,
+            Tiers:          nil,
+            CurrentTierIdx: 0,
+            CurrentTier:    "",
+            PerTier:        map[string]*perTierState{},
+        }
+        pressureState[nodeName] = state
+    }
+    state.Tiers = collectSortedTiers(nodePods, rtData)
+
+    // -------- CPU > 90% 지속 시 단계별 처리 --------
+    state.AboveSec = overSec
+
+    // Tier가 없으면 스킵
+    if len(state.Tiers) == 0 {
+        logger.V(0).Info("No criticality tiers detected on node; skipping",
+            "cpu(%)", fmt.Sprintf("%.1f", pct), "over90Sec", overSec)
+        return
+    }
+
+    // Current tier 설정
+    if state.CurrentTier == "" || state.CurrentTierIdx >= len(state.Tiers) {
+        state.CurrentTierIdx = 0
+        state.CurrentTier = state.Tiers[0]
+        if _, ok := state.PerTier[state.CurrentTier]; !ok {
+            state.PerTier[state.CurrentTier] = &perTierState{}
+        }
+        logger.V(0).Info("Pinning current tier to lowest detected tier",
+            "tier", state.CurrentTier)
+    }
+
+    curTier := state.CurrentTier
+    pts := state.PerTier[curTier]
+    if pts == nil {
+        pts = &perTierState{}
+        state.PerTier[curTier] = pts
+    }
+
+    targets := filterPodsByCriticality(nodePods, rtData, curTier)
+    targetsCount := len(targets)
+
+    logger.V(0).Info("Node pressure snapshot",
+        "cpu(%)", fmt.Sprintf("%.1f", pct),
+        "over90Sec", overSec,
+        "currentTier", curTier,
+        "targetsCount", targetsCount,
+        "degradeTried", pts.DegradeTried,
+        "evictTried", pts.EvictTried,
+    )
+
+    // Targets가 없으면 다음 tier로 에스컬레이션
+    if targetsCount == 0 {
+        pts.MissingTicks++
+        logger.V(0).Info("No targets in current tier; incrementing MissingTicks",
+            "tier", curTier, "missingTicks", pts.MissingTicks)
+
+        if pts.MissingTicks >= tierMissingTolerance && state.CurrentTierIdx+1 < len(state.Tiers) {
+            nextIdx := state.CurrentTierIdx + 1
+            nextTier := state.Tiers[nextIdx]
+            logger.V(0).Info("Escalating to next criticality tier",
+                "fromTier", curTier, "toTier", nextTier)
+            state.CurrentTierIdx = nextIdx
+            state.CurrentTier = nextTier
+            if _, ok := state.PerTier[nextTier]; !ok {
+                state.PerTier[nextTier] = &perTierState{}
+            }
+        }
+        return
+    }
+
+    pts.MissingTicks = 0
+
+    // -------- 시간 기반 단계별 처리 (순차적 처리) --------
+    // Stage 1: 1초 후 degradation (30% 감소)
+    if overSec >= 1 && !pts.DegradeTried && !pts.EvictTried {
+        top := pickHighestCPUFromMilli(targets, podMilli)
+        if top != nil {
+            logger.V(0).Info("Stage 1: Attempting graceful degradation (-30% requests) on heaviest pod",
+                "tier", curTier, "pod", top.Name, "over90Sec", overSec)
+            if err := r.degradePodRequests(ctx, top, 0.3); err != nil {
+                if errors.Is(err, ErrResizeUnsupported) {
+                    logger.V(0).Info("In-place resize unsupported; stop further degrade attempts",
+                        "tier", curTier, "pod", top.Name)
+                    pts.DegradeTried = true // mark to stop repeating degrade when resize unsupported
+                } else {
+                    logger.Error(err, "Graceful degradation failed",
+                        "tier", curTier, "pod", top.Name)
+                    pts.DegradeTried = true // avoid spamming on repeated errors
+                }
+            } else {
+                logger.V(0).Info("Stage 1: Graceful degradation applied",
+                    "tier", curTier, "pod", top.Name)
+                pts.DegradeTried = true // mark as completed
+            }
+        }
+    } else if overSec >= 10 && pts.DegradeTried && !pts.EvictTried {
+        // Stage 2: 10초 후 eviction (degradation 완료 후)
+        victim := pickHighestCPUFromMilli(targets, podMilli)
+        if victim != nil {
+            logger.V(0).Info("Stage 2: Immediate eviction due to sustained high CPU",
+                "tier", curTier, "pod", victim.Name, "over90Sec", overSec)
+            if err := r.evictPod(ctx, victim); err != nil {
+                logger.Error(err, "Eviction failed",
+                    "tier", curTier, "pod", victim.Name)
+                pts.EvictTried = true // 실패해도 재시도 방지
+            } else {
+                logger.V(0).Info("Stage 2: Eviction succeeded",
+                    "tier", curTier, "pod", victim.Name)
+                
+                // -------- eviction 성공 후 즉시 다음 Pod 처리 준비 --------
+                // 현재 Pod List에서 evicted Pod 제거하여 실시간 반영
+                updatedPods := make([]*corev1.Pod, 0, len(nodePods))
+                for _, p := range nodePods {
+                    if p.Name != victim.Name || p.Namespace != victim.Namespace {
+                        updatedPods = append(updatedPods, p)
+                    }
+                }
+                
+                // 업데이트된 Pod 목록으로 새로운 targets 확인
+                newTargets := filterPodsByCriticality(updatedPods, rtData, curTier)
+                
+                if len(newTargets) > 0 {
+                    // 동일 tier에 더 처리할 Pod가 있으면 즉시 stage 1부터 재시작
+                    logger.V(0).Info("Stage 2: More pods available in current tier, resetting to stage 1",
+                        "tier", curTier, "remainingTargets", len(newTargets))
+                    pts.DegradeTried = false
+                    pts.EvictTried = false
+                } else {
+                    // 동일 tier에 더 이상 Pod가 없으면 즉시 tier escalation
+                    logger.V(0).Info("Stage 2: No more pods in current tier, escalating immediately",
+                        "tier", curTier)
+                    if state.CurrentTierIdx+1 < len(state.Tiers) {
+                        nextIdx := state.CurrentTierIdx + 1
+                        nextTier := state.Tiers[nextIdx]
+                        logger.V(0).Info("Stage 2: Escalating to next criticality tier",
+                            "fromTier", curTier, "toTier", nextTier)
+                        state.CurrentTierIdx = nextIdx
+                        state.CurrentTier = nextTier
+                        if _, ok := state.PerTier[nextTier]; !ok {
+                            state.PerTier[nextTier] = &perTierState{}
+                        }
+                    } else {
+                        logger.V(0).Info("Stage 2: Already at highest tier, maintaining current state",
+                            "tier", curTier)
+                    }
+                }
+                pts.EvictTried = true // eviction 완료 표시
+            }
+        }
+    } else if pts.DegradeTried && pts.EvictTried {
+        // Stage 3: 처리 완료 시 즉시 에스컬레이션 (시간 조건 없음)
+        actionable := hasActionableInTier(nodePods, rtData, curTier)
+        logger.V(0).Info("Stage 3: Escalation gate check (processing completed)",
+            "tier", curTier,
+            "actionable", actionable,
+            "over90Sec", overSec,
+        )
+        if !actionable && state.CurrentTierIdx+1 < len(state.Tiers) {
+            nextIdx := state.CurrentTierIdx + 1
+            nextTier := state.Tiers[nextIdx]
+            logger.V(0).Info("Stage 3: Escalating to next criticality tier",
+                "fromTier", curTier, "toTier", nextTier)
+            state.CurrentTierIdx = nextIdx
+            state.CurrentTier = nextTier
+            if _, ok := state.PerTier[nextTier]; !ok {
+                state.PerTier[nextTier] = &perTierState{}
+            }
+        }
+    }
+}
+
+// Event handler for Node annotation changes
+func (r *McKubeReconciler) findObjectsForNode(ctx context.Context, node client.Object) []reconcile.Request {
+    nodeObj := node.(*corev1.Node)
+    
+    // Check if this node has high CPU annotation
+    ann := nodeObj.GetAnnotations()
+    if ann == nil {
+        return []reconcile.Request{}
+    }
+    
+    cpuUsageStr := strings.TrimSpace(ann[annUsageKey])
+    if cpuUsageStr == "" {
+        return []reconcile.Request{}
+    }
+    
+    cpuUsage, err := strconv.ParseFloat(cpuUsageStr, 64)
+    if err != nil {
+        return []reconcile.Request{}
+    }
+    
+    // Only trigger for CPU > 90%
+    if cpuUsage > cpuThresholdPercent {
+        logger := log.Log.WithValues("McKube/rt.NodeEvent", "CPU>90%")
+        logger.V(0).Info("High CPU detected on node, triggering adaptive control",
+            "node", nodeObj.Name, "cpu(%)", fmt.Sprintf("%.1f", cpuUsage))
+        
+        // Process immediately in background
+        go r.handleNodeCPUPressure(ctx, nodeObj.Name)
+    }
+    
+    return []reconcile.Request{}
+}
+
 func (r *McKubeReconciler) StartAdaptiveControlLoop() {
-	go func() {
-		logger := log.Log.WithValues("McKube/rt.AdaptiveControlLoop", "CPU>90%")
-		logger.V(1).Info("Starting adaptive control loop")
-
-		ticker := time.NewTicker(time.Duration(controlTickSeconds) * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			ctx := context.TODO()
-
-			nodeList := &corev1.NodeList{}
-			if err := r.List(ctx, nodeList); err != nil {
-				logger.Error(err, "Failed to list nodes")
-				continue
-			}
-
-			rtData, err := r.GetRealTimeData(ctx)
-			if err != nil {
-				logger.Error(err, "Failed to get RT data")
-				continue
-			}
-
-			podList := &corev1.PodList{}
-			if err := r.List(ctx, podList, client.InNamespace(targetNamespace)); err != nil {
-				logger.Error(err, "Failed to list pods", "namespace", targetNamespace)
-				continue
-			}
-
-			podsByNode := map[string][]*corev1.Pod{}
-			for i := range podList.Items {
-				p := &podList.Items[i]
-				if p.Spec.NodeName == "" {
-					continue
-				}
-				podsByNode[p.Spec.NodeName] = append(podsByNode[p.Spec.NodeName], p)
-			}
-
-			for i := range nodeList.Items {
-				node := &nodeList.Items[i]
-				nodePods := podsByNode[node.Name]
-				if len(nodePods) == 0 {
-					continue
-				}
-
-				pct, err := r.getNodeCPUPercent(ctx, node)
-				if err != nil {
-					logger.Error(err, "Failed to get node CPU percent (annotation)", "node", node.Name)
-					continue
-				}
-				overSec, err := r.getNodeOver90Seconds(ctx, node)
-				if err != nil {
-					logger.V(1).Info("Failed to get over90 duration; treating as 0", "node", node.Name, "err", err.Error())
-					overSec = 0
-				}
-
-				podMilli, err := r.listPodMilliCPUByNode(ctx, targetNamespace, node)
-				if err != nil {
-					logger.Error(err, "Failed to list pod milliCPU (requests-based)", "node", node.Name)
-					continue
-				}
-
-				// Initialize or get existing state for this node
-				state := pressureState[node.Name]
-				if state == nil {
-					state = &NodePressureState{
-						AboveSec:       0,
-						Tiers:          nil,
-						CurrentTierIdx: 0,
-						CurrentTier:    "",
-						PerTier:        map[string]*perTierState{},
-					}
-					pressureState[node.Name] = state
-				}
-				state.Tiers = collectSortedTiers(nodePods, rtData)
-
-				// -------- CPU가 90% 이하로 떨어지면 상태 리셋 --------
-				if pct <= cpuThresholdPercent {
-					logger.V(0).Info("Node CPU below threshold: resetting pressure state",
-						"node", node.Name, "cpu(%)", fmt.Sprintf("%.1f", pct))
-					delete(pressureState, node.Name)
-					continue
-				}
-
-				// -------- CPU > 90% 지속 시 단계별 처리 --------
-				if pct > cpuThresholdPercent {
-					state.AboveSec = overSec
-
-					// Tier가 없으면 스킵
-					if len(state.Tiers) == 0 {
-						logger.V(0).Info("No criticality tiers detected on node; skipping",
-							"node", node.Name, "cpu(%)", fmt.Sprintf("%.1f", pct), "over90Sec", overSec)
-						continue
-					}
-
-					// Current tier 설정
-					if state.CurrentTier == "" || state.CurrentTierIdx >= len(state.Tiers) {
-						state.CurrentTierIdx = 0
-						state.CurrentTier = state.Tiers[0]
-						if _, ok := state.PerTier[state.CurrentTier]; !ok {
-							state.PerTier[state.CurrentTier] = &perTierState{}
-						}
-						logger.V(0).Info("Pinning current tier to lowest detected tier",
-							"node", node.Name, "tier", state.CurrentTier)
-					}
-
-					curTier := state.CurrentTier
-					pts := state.PerTier[curTier]
-					if pts == nil {
-						pts = &perTierState{}
-						state.PerTier[curTier] = pts
-					}
-
-					targets := filterPodsByCriticality(nodePods, rtData, curTier)
-					targetsCount := len(targets)
-
-					logger.V(0).Info("Node pressure snapshot",
-						"node", node.Name,
-						"cpu(%)", fmt.Sprintf("%.1f", pct),
-						"over90Sec", overSec,
-						"currentTier", curTier,
-						"targetsCount", targetsCount,
-						"elapsedSec(tier)", pts.ElapsedSec,
-						"degradeTried", pts.DegradeTried,
-						"evictTried", pts.EvictTried,
-					)
-
-					// Targets가 없으면 다음 tier로 에스컬레이션
-					if targetsCount == 0 {
-						pts.MissingTicks++
-						logger.V(0).Info("No targets in current tier; incrementing MissingTicks",
-							"node", node.Name, "tier", curTier, "missingTicks", pts.MissingTicks)
-
-						if pts.MissingTicks >= tierMissingTolerance && state.CurrentTierIdx+1 < len(state.Tiers) {
-							nextIdx := state.CurrentTierIdx + 1
-							nextTier := state.Tiers[nextIdx]
-							logger.V(0).Info("Escalating to next criticality tier",
-								"node", node.Name, "fromTier", curTier, "toTier", nextTier)
-							state.CurrentTierIdx = nextIdx
-							state.CurrentTier = nextTier
-							if _, ok := state.PerTier[nextTier]; !ok {
-								state.PerTier[nextTier] = &perTierState{}
-							}
-						}
-						continue
-					}
-
-					pts.MissingTicks = 0
-					pts.ElapsedSec += controlTickSeconds
-
-					// -------- Stage 1: 1초 후부터 Stage2 전까지 매 틱 request 패치 (30% 감소) --------
-					if pts.ElapsedSec >= 1 && !pts.EvictTried {
-						top := pickHighestCPUFromMilli(targets, podMilli)
-						if top != nil {
-							logger.V(0).Info("Stage 1: Attempting graceful degradation (-30% requests) on heaviest pod",
-								"node", node.Name, "tier", curTier, "pod", top.Name)
-							if err := r.degradePodRequests(ctx, top, 0.3); err != nil {
-								if errors.Is(err, ErrResizeUnsupported) {
-									logger.V(0).Info("In-place resize unsupported; stop further degrade attempts",
-										"node", node.Name, "tier", curTier, "pod", top.Name)
-									pts.DegradeTried = true // mark to stop repeating degrade when resize unsupported
-								} else {
-									logger.Error(err, "Graceful degradation failed",
-										"node", node.Name, "tier", curTier, "pod", top.Name)
-									pts.DegradeTried = true // avoid spamming on repeated errors
-								}
-							} else {
-								logger.V(0).Info("Stage 1: Graceful degradation applied",
-									"node", node.Name, "tier", curTier, "pod", top.Name)
-								// On success, keep DegradeTried=false so we continue degrading next ticks until eviction
-							}
-						}
-					}
-
-					// -------- Stage 2: 10초 후 eviction --------
-					if pts.ElapsedSec >= 10 && !pts.EvictTried {
-						victim := pickHighestCPUFromMilli(targets, podMilli)
-						if victim != nil {
-							logger.V(0).Info("Stage 2: Attempting eviction due to sustained high node CPU",
-								"node", node.Name, "tier", curTier, "pod", victim.Name)
-							if err := r.evictPod(ctx, victim); err != nil {
-								logger.Error(err, "Eviction failed",
-									"node", node.Name, "tier", curTier, "pod", victim.Name)
-							} else {
-								logger.V(0).Info("Stage 2: Eviction succeeded",
-									"node", node.Name, "tier", curTier, "pod", victim.Name)
-							}
-							pts.EvictTried = true
-						}
-					}
-
-					// -------- Stage 3: 20초 후 다음 tier로 에스컬레이션 --------
-					if pts.ElapsedSec >= 20 && pts.DegradeTried && pts.EvictTried {
-						actionable := hasActionableInTier(nodePods, rtData, curTier)
-						logger.V(0).Info("Stage 3: Escalation gate check",
-							"node", node.Name,
-							"tier", curTier,
-							"actionable", actionable,
-							"elapsedSec(tier)", pts.ElapsedSec,
-						)
-						if !actionable && state.CurrentTierIdx+1 < len(state.Tiers) {
-							nextIdx := state.CurrentTierIdx + 1
-							nextTier := state.Tiers[nextIdx]
-							logger.V(0).Info("Stage 3: Escalating to next criticality tier",
-								"node", node.Name, "fromTier", curTier, "toTier", nextTier)
-							state.CurrentTierIdx = nextIdx
-							state.CurrentTier = nextTier
-							if _, ok := state.PerTier[nextTier]; !ok {
-								state.PerTier[nextTier] = &perTierState{}
-							}
-						}
-					}
-				}
-			}
-		}
-	}()
+    // This function is now replaced by event-driven architecture
+    // The actual processing happens in handleNodeCPUPressure when Node annotations change
+    logger := log.Log.WithValues("McKube/rt.AdaptiveControlLoop", "EventDriven")
+    logger.V(0).Info("Adaptive control loop is now event-driven - listening for Node annotation changes")
 }
 
 func collectSortedTiers(pods []*corev1.Pod, rtData map[string]RealTimeData) []string {
@@ -685,6 +757,64 @@ func (r *McKubeReconciler) evictPod(ctx context.Context, pod *corev1.Pod) error 
 }
 
 // ===================== Utils / timing =====================
+
+// SendCgroupRequest sends a cgroup RT signal (period/runtime) to the daemon on a specific node
+// for a specific container within the given Pod. If containerName is empty, the first container
+// with a non-empty ContainerID is used.
+// The daemon is expected to listen on http://<nodeIP>:8080/cgroup (see PC_setting/resource/main.go).
+func (r *McKubeReconciler) SendCgroupRequest(ctx context.Context, pod *corev1.Pod, nodeIP string, containerName string, period int, runtime int) error {
+	if pod == nil {
+		return fmt.Errorf("pod is nil")
+	}
+	if nodeIP == "" {
+		return fmt.Errorf("nodeIP is empty")
+	}
+
+	// Resolve container ID
+	containerID := ""
+	for _, st := range pod.Status.ContainerStatuses {
+		if containerName != "" && st.Name != containerName {
+			continue
+		}
+		if st.ContainerID != "" {
+			containerID = st.ContainerID
+			break
+		}
+	}
+	if containerID == "" {
+		return fmt.Errorf("no container id found on pod %s/%s (containerName=%s)", pod.Namespace, pod.Name, containerName)
+	}
+
+	// Build payload
+	payload := map[string]any{
+		"container_id": containerID,
+		"period":       period,
+		"runtime":      runtime,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal cgroup payload: %w", err)
+	}
+
+	// POST to node-local daemon
+	url := fmt.Sprintf("http://%s:8080/cgroup", nodeIP)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post to daemon: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("daemon responded with status %s", resp.Status)
+	}
+	return nil
+}
 
 func track(msg string) (string, time.Time) {
 	return msg, time.Now()
@@ -761,13 +891,17 @@ func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	// Start loops
 	r.StartAdaptiveControlLoop()
-	r.StartTaintThread() // 남겨둠
+	r.StartTaintThread()
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mcoperatorv1.McKube{}).
 		Watches(
 			&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(r.findObjectsForPod)),
+		).
+		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(r.findObjectsForNode)),
 		).
 		Complete(r)
 }

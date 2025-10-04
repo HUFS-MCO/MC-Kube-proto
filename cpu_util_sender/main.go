@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	annUsageKey = "mckube.sdv.com/cpu-usage"
-	annDurKey   = "mckube.sdv.com/cpu-over90-duration-s"
+	annUsageKey   = "mckube.sdv.com/cpu-usage"
+	annDurKey     = "mckube.sdv.com/cpu-over90-duration-s"
+	annCpuBusyKey = "mckube.sdv.com/isCpuBusy"
 )
 
 type cpuSample struct{ idle, total uint64 }
@@ -101,17 +102,18 @@ func getNodeName() string {
 	return strings.ToLower(strings.TrimSpace(string(out2)))
 }
 
-func annotate(node string, usage int, over90time int64) error {
+func annotate(node string, usage int, over90time int64, isCpuBusy string) error {
 	kubectl := strings.TrimSpace(os.Getenv("KUBECTL"))
 	if kubectl == "" {
 		kubectl = "/usr/bin/kubectl"
 	}
-	node = strings.ToLower(node) // 안전 장치
+	node = strings.ToLower(node)
 
 	args := []string{
 		"annotate", "node", node,
 		fmt.Sprintf("%s=%d", annUsageKey, usage),
 		fmt.Sprintf("%s=%d", annDurKey, over90time),
+		fmt.Sprintf("%s=%s", annCpuBusyKey, isCpuBusy),
 		"--overwrite",
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -124,7 +126,7 @@ func annotate(node string, usage int, over90time int64) error {
 		log.Printf("kubectl annotate failed: %v, stderr=%s", err, strings.TrimSpace(stderr.String()))
 		return err
 	}
-	log.Printf("annotate success: node=%s usage=%d%% over90time=%ds", node, usage, over90time)
+	log.Printf("annotate success: node=%s usage=%d%% over90time=%ds isCpuBusy=%s", node, usage, over90time, isCpuBusy)
 	return nil
 }
 
@@ -147,6 +149,8 @@ func main() {
 	var over90time int64
 	var lastAnnUsage = -1
 	var lastAnnTime time.Time
+	var droppedBelowTime time.Time // CPU가 90% 미만으로 떨어진 시점
+	var waitingForBusyFalse bool   // isCpuBusy를 false로 보내기 위해 대기 중인지 여부
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -167,10 +171,36 @@ func main() {
 
 		log.Printf("publishing cpu usage: node=%s usage=%d%% over90time=%ds", node, u, over90time)
 
-		if (u != lastAnnUsage) || time.Since(lastAnnTime) > 5*time.Second {
-			if err := annotate(node, u, over90time); err == nil {
-				lastAnnUsage = u
-				lastAnnTime = time.Now()
+		// CPU 사용량이 90% 이상일 때 annotation 갱신 (이벤트 기반 트리거)
+		if u > 90 {
+			// 90% 이상이면 대기 상태 해제
+			waitingForBusyFalse = false
+			
+			if (u != lastAnnUsage) || time.Since(lastAnnTime) > 5*time.Second {
+				if err := annotate(node, u, over90time, "true"); err == nil {
+					lastAnnUsage = u
+					lastAnnTime = time.Now()
+				}
+			}
+		} else {
+			// CPU가 90% 미만으로 떨어진 경우
+			if lastAnnUsage > 90 {
+				// 최초로 90% 미만으로 떨어진 시점
+				log.Printf("CPU dropped below 90%%, sending reset annotation: node=%s usage=%d%%", node, u)
+				if err := annotate(node, u, over90time, "true"); err == nil {
+					lastAnnUsage = u
+					lastAnnTime = time.Now()
+					droppedBelowTime = time.Now()
+					waitingForBusyFalse = true
+				}
+			} else if waitingForBusyFalse && time.Since(droppedBelowTime) >= 5*time.Second {
+				// 5초 후에도 90% 미만이면 isCpuBusy를 false로 설정
+				log.Printf("5 seconds passed below 90%%, setting isCpuBusy to false: node=%s usage=%d%%", node, u)
+				if err := annotate(node, u, over90time, "false"); err == nil {
+					lastAnnUsage = u
+					lastAnnTime = time.Now()
+					waitingForBusyFalse = false
+				}
 			}
 		}
 	}

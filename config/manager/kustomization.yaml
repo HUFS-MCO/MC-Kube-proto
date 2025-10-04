@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: noru0817/ipvs_test
-  newTag: 0.0.1
+  newTag: 1.0.2
