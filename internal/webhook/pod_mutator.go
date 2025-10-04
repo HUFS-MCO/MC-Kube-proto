@@ -53,11 +53,11 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 	// Check if RT annotations are already applied or in progress
 	if pod.Annotations != nil {
 		if applied, exists := pod.Annotations["mckube.io/rt-applied"]; exists && applied == "true" {
-			log.Info("RT annotations already applied, skipping", "pod", pod.Name)
+			log.Log.Info("RT annotations already applied, skipping", "pod", pod.Name)
 			return admission.Allowed("RT annotations already applied")
 		}
 		if pending, exists := pod.Annotations["mckube.io/rt-pending"]; exists && pending == "true" {
-			log.Info("RT configuration already in progress, skipping", "pod", pod.Name)
+			log.Log.Info("RT configuration already in progress, skipping", "pod", pod.Name)
 			return admission.Allowed("RT configuration already in progress")
 		}
 	}
