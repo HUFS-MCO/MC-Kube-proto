@@ -1,0 +1,7 @@
+---
+- op: replace
+  path: /webhooks/0/clientConfig/service/name
+  value: mc-kube-webhook-service
+- op: replace
+  path: /webhooks/0/clientConfig/service/namespace
+  value: mc-kube-system

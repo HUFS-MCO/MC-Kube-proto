@@ -170,6 +170,12 @@ func main() {
 		setupLog.Info("PodMutator created successfully", "mutator", podMutator)
 		mgr.GetWebhookServer().Register("/mutate-v1-pod", &webhook.Admission{Handler: podMutator})
 		setupLog.Info("webhook registered", "path", "/mutate-v1-pod")
+
+		// Setup ValidatingWebhook
+		setupLog.Info("Creating RTValidator instance")
+		rtValidator := &mcwebhook.RTValidator{Client: mgr.GetClient()}
+		mgr.GetWebhookServer().Register("/validate-rt-pod", &webhook.Admission{Handler: rtValidator})
+		setupLog.Info("validating webhook registered", "path", "/validate-rt-pod")
 	}
 
 	// +kubebuilder:scaffold:builder
