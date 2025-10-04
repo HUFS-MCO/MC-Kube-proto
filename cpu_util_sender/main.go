@@ -191,34 +191,45 @@ func main() {
 
 		log.Printf("publishing cpu usage: node=%s usage=%d%% over90time=%ds", node, u, over90time)
 
-		// CPU 사용량이 90% 이상일 때만 annotation 갱신 (이벤트 기반 트리거)
+		// 이벤트 기반: 의미있는 변화가 있을 때만 annotation 갱신
+		shouldUpdate := false
+		var isCpuBusy *bool
+		
 		if u > 90 {
+			// CPU 90% 이상: 사용률 변화가 있거나 5초마다 갱신
 			if (u != lastAnnUsage) || time.Since(lastAnnTime) > 5*time.Second {
-				isCpuBusy := true
-				if err := annotate(node, u, over90time, &isCpuBusy); err == nil {
-					lastAnnUsage = u
-					lastAnnTime = time.Now()
+				shouldUpdate = true
+				busyVal := true
+				isCpuBusy = &busyVal
+				// 90% 이상에서 다시 돌아온 경우 대기 상태 리셋
+				if waitingForBusyFalse {
+					waitingForBusyFalse = false
+					log.Printf("CPU went back above 90%%, canceling isCpuBusy=false timer")
 				}
 			}
 		} else {
-			// CPU가 90% 미만으로 떨어졌을 때
+			// CPU 90% 미만: 상태 변화가 있을 때만 갱신
 			if lastAnnUsage > 90 {
+				// 최초로 90% 미만으로 떨어진 경우
 				log.Printf("CPU dropped below 90%%, sending reset annotation: node=%s usage=%d%%", node, u)
-				if err := annotate(node, u, over90time, nil); err == nil {
-					lastAnnUsage = u
-					lastAnnTime = time.Now()
-					waitingForBusyFalse = true
-				}
-			}
-			
-			// 90% 미만으로 떨어진 시점으로부터 5초 후 isCpuBusy=false 전송
-			if waitingForBusyFalse && !dropBelowTime.IsZero() && time.Since(dropBelowTime) >= 5*time.Second {
+				shouldUpdate = true
+				waitingForBusyFalse = true
+			} else if waitingForBusyFalse && !dropBelowTime.IsZero() && time.Since(dropBelowTime) >= 5*time.Second {
+				// 5초 후 isCpuBusy=false 전송
 				log.Printf("5 seconds passed since CPU dropped below 90%%, sending isCpuBusy=false")
-				isCpuBusy := false
-				if err := annotate(node, u, over90time, &isCpuBusy); err == nil {
-					waitingForBusyFalse = false
-					dropBelowTime = time.Time{} // 시간 리셋
-				}
+				shouldUpdate = true
+				busyVal := false
+				isCpuBusy = &busyVal
+				waitingForBusyFalse = false
+				dropBelowTime = time.Time{} // 시간 리셋
+			}
+		}
+		
+		// annotation 업데이트 (필요한 경우에만)
+		if shouldUpdate {
+			if err := annotate(node, u, over90time, isCpuBusy); err == nil {
+				lastAnnUsage = u
+				lastAnnTime = time.Now()
 			}
 		}
 	}

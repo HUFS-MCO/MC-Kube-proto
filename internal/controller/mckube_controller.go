@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -120,6 +121,10 @@ type perTierState struct {
 }
 
 var pressureState = make(map[string]*NodePressureState)
+
+// Track nodes being processed to prevent duplicate processing
+var processingNodes = make(map[string]bool)
+var processingMutex sync.RWMutex
 
 const minMilli = int64(10)
 const tierMissingTolerance = 2
@@ -508,7 +513,7 @@ func hasActionableInTier(pods []*corev1.Pod, rtData map[string]RealTimeData, tie
 
 // handleNodeCPUPressure processes a node when CPU pressure is detected or resolved
 func (r *McKubeReconciler) handleNodeCPUPressure(ctx context.Context, nodeName string) {
-    logger := log.Log.WithValues("McKube/rt.AdaptiveControlLoop", "EventDriven", "node", nodeName)
+    logger := log.Log.WithValues("McKube/rt.CPUPressureHandler", "EventDriven", "node", nodeName)
     
     node := &corev1.Node{}
     if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
@@ -776,8 +781,13 @@ func (r *McKubeReconciler) findObjectsForNode(ctx context.Context, node client.O
         "cpu(%)", fmt.Sprintf("%.1f", cpuUsage),
         "isCpuBusy", isCpuBusy)
     
-    // Process immediately in background
-    go r.handleNodeCPUPressure(ctx, nodeObj.Name)
+    // Process immediately in background with new context
+    go func() {
+        // Create new context with timeout for background processing
+        bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        r.handleNodeCPUPressure(bgCtx, nodeObj.Name)
+    }()
     
     return []reconcile.Request{}
 }
@@ -896,7 +906,6 @@ func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	// Start loops
-	r.StartAdaptiveControlLoop()
 	r.StartTaintThread() // 남겨둠
 
 	return ctrl.NewControllerManagedBy(mgr).
