@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -49,6 +50,18 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 
 	log.Log.Info("Pod unmarshaled successfully", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
 
+	// Check if RT annotations are already applied or in progress
+	if pod.Annotations != nil {
+		if applied, exists := pod.Annotations["mckube.io/rt-applied"]; exists && applied == "true" {
+			log.Info("RT annotations already applied, skipping", "pod", pod.Name)
+			return admission.Allowed("RT annotations already applied")
+		}
+		if pending, exists := pod.Annotations["mckube.io/rt-pending"]; exists && pending == "true" {
+			log.Info("RT configuration already in progress, skipping", "pod", pod.Name)
+			return admission.Allowed("RT configuration already in progress")
+		}
+	}
+
 	// Check if there's a matching McKube resource with RT settings
 	rtSettings, err := m.findRTSettingsForPod(ctx, pod)
 	if err != nil {
@@ -67,6 +80,13 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
+	
+	// Check if RT configuration is already pending or configured
+	if pod.Annotations["mckube.io/rt-pending"] == "true" || pod.Annotations["mckube.io/rt-configured"] == "true" {
+		log.Log.Info("RT configuration already in progress or completed", "pod.name", pod.Name)
+		return admission.Allowed("RT configuration already handled")
+	}
+	
 	pod.Annotations["mckube.io/rt-pending"] = "true"
 	pod.Annotations["mckube.io/rt-period"] = fmt.Sprintf("%d", rtSettings.Period)
 	pod.Annotations["mckube.io/rt-runtime"] = fmt.Sprintf("%d", rtSettings.Runtime)
@@ -117,6 +137,16 @@ func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) 
 }
 
 func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Pod, rtSettings *mcoperatorv1.RTSettings) {
+	// Check if RT configuration is already applied or in progress
+	if pod.Annotations != nil {
+		if configured, exists := pod.Annotations["mckube.io/rt-configured"]; exists && configured == "true" {
+			log.Log.Info("RT configuration already completed, skipping", "pod", pod.Name)
+			return
+		}
+	}
+
+	log.Log.Info("Starting RT configuration scheduling", "pod", pod.Name, "namespace", pod.Namespace)
+	
 	// Wait for pod to be scheduled and containers to be created
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -186,11 +216,27 @@ func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.P
 	// Call rt-daemon on the node
 	daemonURL := fmt.Sprintf("http://%s:8080/cgroup", nodeIP)
 
+	// Get container ID from pod status
+	if len(pod.Status.ContainerStatuses) == 0 {
+		log.Log.Error(fmt.Errorf("no container statuses"), "Pod has no container statuses", "pod", pod.Name)
+		return false
+	}
+
+	containerID := pod.Status.ContainerStatuses[0].ContainerID
+	if containerID == "" {
+		log.Log.Error(fmt.Errorf("container ID is empty"), "Container ID not available", "pod", pod.Name)
+		return false
+	}
+
+	// Extract container ID from the full URI (e.g., "containerd://abc123" -> "abc123")
+	if idx := strings.LastIndex(containerID, "://"); idx != -1 {
+		containerID = containerID[idx+3:]
+	}
+
 	requestBody := map[string]interface{}{
-		"pod_name":  pod.Name,
-		"namespace": pod.Namespace,
-		"period":    rtSettings.Period,
-		"runtime":   rtSettings.Runtime,
+		"container_id": containerID,
+		"period":       rtSettings.Period,
+		"runtime":      rtSettings.Runtime,
 	}
 
 	if rtSettings.Core != nil {
