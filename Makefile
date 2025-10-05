@@ -186,9 +186,22 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: manifests kustomize cert-manager ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+
+.PHONY: cert-manager
+cert-manager: ## Install cert-manager if not already installed
+	@echo "Checking if cert-manager is installed..."
+	@if ! $(KUBECTL) get namespace cert-manager >/dev/null 2>&1; then \
+		echo "Installing cert-manager..."; \
+		$(KUBECTL) apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.2/cert-manager.yaml; \
+		echo "Waiting for cert-manager to be ready..."; \
+		$(KUBECTL) wait --for=condition=Available --timeout=300s deployment/cert-manager -n cert-manager; \
+		$(KUBECTL) wait --for=condition=Available --timeout=300s deployment/cert-manager-webhook -n cert-manager; \
+	else \
+		echo "cert-manager is already installed"; \
+	fi
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
