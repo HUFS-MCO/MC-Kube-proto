@@ -119,13 +119,6 @@ type perTierState struct {
 	LastDegradeTime int // Timestamp of last degradation attempt
 }
 
-// ===================== OverrunData for logging overrun events =====================
-type OverrunData struct {
-	NodeName    string `json:"node_name,omitempty"`    // optional
-    ContainerID string `json:"container_id"`           // required
-    Timestamp   int64  `json:"timestamp,omitempty"`    // optional
-}
-
 var pressureState = make(map[string]*NodePressureState)
 
 // Track nodes being processed to prevent duplicate processing
@@ -1007,7 +1000,6 @@ func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	// Start loops
 	r.StartTaintThread() // 남겨둠
-	r.StartOverrunListener(8090)  // Overrun 수신 포트 선언
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mcoperatorv1.McKube{}).
@@ -1136,162 +1128,4 @@ func (r *McKubeReconciler) sendRTRequest(nodeIP string, req CgroupRequest) error
 	}
 
 	return nil
-}
-
-// ===================== Overrun Listening Thread =====================
-
-func (r *McKubeReconciler) StartOverrunListener(port int) {
-	go func() {
-		logger := log.Log.WithValues("McKube/rt.OverrunListener", "HTTP")
-		logger.V(0).Info("Starting overrun listener", "port", port)
-
-		http.HandleFunc("/overrun", func(w http.ResponseWriter, req *http.Request) {
-			if req.Method != http.MethodPost {
-				logger.V(1).Info("Invalid method for /overrun", "method", req.Method)
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-
-			var data OverrunData
-			decoder := json.NewDecoder(req.Body)
-			if err := decoder.Decode(&data); err != nil {
-				logger.Error(err, "Failed to decode overrun data")
-				http.Error(w, "Invalid JSON", http.StatusBadRequest)
-				return
-			}
-
-			logger.V(0).Info("Received overrun event",
-				"node", data.NodeName,
-				"containerID", data.ContainerID,
-				"timestamp", data.Timestamp)
-
-			// overrun 이벤트 처리 로직 호출
-			r.handleOverrunEvent(data)
-
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("OK"))
-		})
-
-		addr := fmt.Sprintf(":%d", port)
-		logger.V(0).Info("Overrun listener ready", "address", addr)
-		
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			logger.Error(err, "Overrun listener failed to start")
-		}
-	}()
-}
-
-func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
-	logger := log.Log.WithValues("McKube/rt.OverrunHandler", "Overrun")
-	ctx := context.TODO()
-	
-	logger.V(0).Info("=== Overrun Event Detected ===",
-		"nodeName", data.NodeName,
-		"containerID", data.ContainerID,
-		"timestamp", data.Timestamp)
-
-	// Find the pod associated with this container ID
-	pod, err := r.findPodByContainerID(ctx, data.NodeName, data.ContainerID)
-	if err != nil {
-		logger.Error(err, "Failed to find pod for container",
-			"containerID", data.ContainerID,
-			"nodeName", data.NodeName)
-		return
-	}
-
-	if pod == nil {
-		logger.V(0).Info("No pod found for container ID",
-			"containerID", data.ContainerID,
-			"nodeName", data.NodeName)
-		return
-	}
-
-	// Find the specific container name within the pod
-	containerName := ""
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.ContainerID == data.ContainerID {
-			containerName = cs.Name
-			break
-		}
-	}
-
-	// Log the pod information
-	logger.V(0).Info("=== Overrun Pod Identified ===",
-		"podName", pod.Name,
-		"namespace", pod.Namespace,
-		"nodeName", pod.Spec.NodeName,
-		"containerName", containerName,
-		"containerID", data.ContainerID,
-		"podPhase", pod.Status.Phase,
-		"timestamp", data.Timestamp)
-
-	// Get criticality if available
-	if app, ok := pod.Labels["sdv.com"]; ok {
-		rtData, err := r.GetRealTimeData(ctx)
-		if err == nil {
-			if rt, found := rtData[app]; found {
-				logger.V(0).Info("Pod RT Information",
-					"podName", pod.Name,
-					"criticality", rt.Criticality,
-					"rtPeriod", rt.RTPeriod,
-					"rtDeadline", rt.RTDeadline)
-			}
-		}
-	}
-}
-
-// findPodByContainerID searches for a pod with the given container ID on the specified node
-func (r *McKubeReconciler) findPodByContainerID(ctx context.Context, nodeName string, containerID string) (*corev1.Pod, error) {
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList); err != nil {
-		return nil, fmt.Errorf("failed to list pods: %v", err)
-	}
-
-	// Normalize container ID (remove runtime prefix if present)
-	// Container IDs can be in format: containerd://abc123 or docker://abc123
-	normalizedID := containerID
-	if idx := strings.Index(containerID, "://"); idx != -1 {
-		normalizedID = containerID[idx+3:]
-	}
-
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		
-		// If nodeName is provided, filter by node; otherwise search all nodes.
-        if nodeName != "" && pod.Spec.NodeName != nodeName {
-            continue
-        }
-
-		// Check all container statuses
-		for _, cs := range pod.Status.ContainerStatuses {
-			// Normalize the container status ID as well
-			statusID := cs.ContainerID
-			if idx := strings.Index(statusID, "://"); idx != -1 {
-				statusID = statusID[idx+3:]
-			}
-
-			// Match either full or normalized IDs
-			if cs.ContainerID == containerID || 
-			   statusID == normalizedID || 
-			   strings.Contains(cs.ContainerID, normalizedID) {
-				return pod, nil
-			}
-		}
-
-		// Also check init container statuses
-		for _, cs := range pod.Status.InitContainerStatuses {
-			statusID := cs.ContainerID
-			if idx := strings.Index(statusID, "://"); idx != -1 {
-				statusID = statusID[idx+3:]
-			}
-
-			if cs.ContainerID == containerID || 
-			   statusID == normalizedID || 
-			   strings.Contains(cs.ContainerID, normalizedID) {
-				return pod, nil
-			}
-		}
-	}
-
-	return nil, nil
 }
