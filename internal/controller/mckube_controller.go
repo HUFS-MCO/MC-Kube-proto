@@ -117,9 +117,9 @@ type perTierState struct {
 
 // ===================== OverrunData for logging overrun events =====================
 type OverrunData struct {
-	NodeName    string `json:"node_name"`
-	ContainerID string `json:"container_id"`
-	Timestamp   int64  `json:"timestamp"`
+	NodeName    string `json:"node_name,omitempty"`    // optional
+    ContainerID string `json:"container_id"`           // required
+    Timestamp   int64  `json:"timestamp,omitempty"`    // optional
 }
 
 var pressureState = make(map[string]*NodePressureState)
@@ -1086,10 +1086,10 @@ func (r *McKubeReconciler) findPodByContainerID(ctx context.Context, nodeName st
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		
-		// Skip pods not on the target node
-		if pod.Spec.NodeName != nodeName {
-			continue
-		}
+		// If nodeName is provided, filter by node; otherwise search all nodes.
+        if nodeName != "" && pod.Spec.NodeName != nodeName {
+            continue
+        }
 
 		// Check all container statuses
 		for _, cs := range pod.Status.ContainerStatuses {
