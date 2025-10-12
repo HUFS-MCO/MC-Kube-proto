@@ -115,12 +115,12 @@ func annotate(node string, usage int, over90time int64, isCpuBusy *bool) error {
 		fmt.Sprintf("%s=%d", annDurKey, over90time),
 		"--overwrite",
 	}
-	
+
 	// isCpuBusy 값이 제공된 경우에만 추가
 	if isCpuBusy != nil {
 		args = append(args, fmt.Sprintf("%s=%t", annCpuBusyKey, *isCpuBusy))
 	}
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, kubectl, args...)
@@ -131,7 +131,7 @@ func annotate(node string, usage int, over90time int64, isCpuBusy *bool) error {
 		log.Printf("kubectl annotate failed: %v, stderr=%s", err, strings.TrimSpace(stderr.String()))
 		return err
 	}
-	
+
 	if isCpuBusy != nil {
 		log.Printf("annotate success: node=%s usage=%d%% over90time=%ds isCpuBusy=%t", node, usage, over90time, *isCpuBusy)
 	} else {
@@ -143,7 +143,7 @@ func annotate(node string, usage int, over90time int64, isCpuBusy *bool) error {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	interval := time.Second // 🔒 1초 고정
+	interval := time.Second // 1초 고정
 	node := getNodeName()
 	if node == "" {
 		log.Fatal("Cannot determine node name")
@@ -159,7 +159,7 @@ func main() {
 	var over90time int64
 	var lastAnnUsage = -1
 	var lastAnnTime time.Time
-	var dropBelowTime time.Time // 90% 미만으로 떨어진 시점
+	var dropBelowTime time.Time  // 90% 미만으로 떨어진 시점
 	var waitingForBusyFalse bool // isCpuBusy=false 전송 대기 상태
 
 	t := time.NewTicker(interval)
@@ -194,7 +194,7 @@ func main() {
 		// 이벤트 기반: 의미있는 변화가 있을 때만 annotation 갱신
 		shouldUpdate := false
 		var isCpuBusy *bool
-		
+
 		if u > 90 {
 			// CPU 90% 이상: 사용률 변화가 있거나 5초마다 갱신
 			if (u != lastAnnUsage) || time.Since(lastAnnTime) > 5*time.Second {
@@ -224,7 +224,7 @@ func main() {
 				dropBelowTime = time.Time{} // 시간 리셋
 			}
 		}
-		
+
 		// annotation 업데이트 (필요한 경우에만)
 		if shouldUpdate {
 			if err := annotate(node, u, over90time, isCpuBusy); err == nil {
