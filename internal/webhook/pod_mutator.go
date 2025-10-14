@@ -24,21 +24,21 @@ type PodMutator struct {
 }
 
 func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admission.Response {
-	log.Log.Info("=== Webhook Handle called ===", "pod.name", req.Name, "pod.namespace", req.Namespace)
+	log.Log.V(1).Info("=== Webhook Handle called ===", "pod.name", req.Name, "pod.namespace", req.Namespace)
 	
 	// Check if receiver m is nil
 	if m == nil {
 		log.Log.Error(fmt.Errorf("PodMutator receiver is nil"), "PodMutator receiver (m) is nil")
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("internal error: PodMutator receiver is nil"))
 	}
-	log.Log.Info("PodMutator receiver is not nil", "mutator", m)
+	log.Log.V(1).Info("PodMutator receiver is not nil", "mutator", m)
 	
 	// Nil check for client
 	if m.client == nil {
 		log.Log.Error(fmt.Errorf("client is nil"), "PodMutator client is nil")
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("internal error: client is nil"))
 	}
-	log.Log.Info("Client is not nil", "client", m.client)
+	log.Log.V(1).Info("Client is not nil", "client", m.client)
 	
 	pod := &corev1.Pod{}
 
@@ -48,16 +48,16 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	log.Log.Info("Pod unmarshaled successfully", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
+	log.Log.V(1).Info("Pod unmarshaled successfully", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
 
 	// Check if RT annotations are already applied or in progress
 	if pod.Annotations != nil {
 		if applied, exists := pod.Annotations["mckube.io/rt-applied"]; exists && applied == "true" {
-			log.Log.Info("RT annotations already applied, skipping", "pod", pod.Name)
+			log.Log.V(1).Info("RT annotations already applied, skipping", "pod", pod.Name)
 			return admission.Allowed("RT annotations already applied")
 		}
 		if pending, exists := pod.Annotations["mckube.io/rt-pending"]; exists && pending == "true" {
-			log.Log.Info("RT configuration already in progress, skipping", "pod", pod.Name)
+			log.Log.V(1).Info("RT configuration already in progress, skipping", "pod", pod.Name)
 			return admission.Allowed("RT configuration already in progress")
 		}
 	}
@@ -69,10 +69,10 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Allowed("No RT settings found")
 	}
 
-	log.Log.Info("RT settings found", "rtSettings", rtSettings)
+	log.Log.V(1).Info("RT settings found", "rtSettings", rtSettings)
 
 	if rtSettings == nil {
-		log.Log.Info("No RT settings configured")
+		log.Log.V(1).Info("No RT settings configured")
 		return admission.Allowed("No RT settings configured")
 	}
 
@@ -83,7 +83,7 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 	
 	// Check if RT configuration is already pending or configured
 	if pod.Annotations["mckube.io/rt-pending"] == "true" || pod.Annotations["mckube.io/rt-configured"] == "true" {
-		log.Log.Info("RT configuration already in progress or completed", "pod.name", pod.Name)
+		log.Log.V(1).Info("RT configuration already in progress or completed", "pod.name", pod.Name)
 		return admission.Allowed("RT configuration already handled")
 	}
 	
@@ -114,7 +114,7 @@ func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) 
 		return nil, fmt.Errorf("pod is nil")
 	}
 	
-	log.Log.Info("Finding RT settings for pod", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
+	log.Log.V(1).Info("Finding RT settings for pod", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
 	
 	mckubeList := &mcoperatorv1.McKubeList{}
 	if err := m.client.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
@@ -122,17 +122,17 @@ func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) 
 		return nil, err
 	}
 
-	log.Log.Info("Found McKube resources", "count", len(mckubeList.Items))
+	log.Log.V(1).Info("Found McKube resources", "count", len(mckubeList.Items))
 
 	for i, mckube := range mckubeList.Items {
-		log.Log.Info("Checking McKube resource", "index", i, "name", mckube.Name, "podName", mckube.Spec.PodName, "targetPod", pod.Name)
+		log.Log.V(1).Info("Checking McKube resource", "index", i, "name", mckube.Name, "podName", mckube.Spec.PodName, "targetPod", pod.Name)
 		if mckube.Spec.PodName == pod.Name && mckube.Spec.RTSettings != nil {
 			log.Log.Info("Found matching RT settings", "mckube.name", mckube.Name)
 			return mckube.Spec.RTSettings, nil
 		}
 	}
 
-	log.Log.Info("No matching RT settings found for pod", "pod.name", pod.Name)
+	log.Log.V(1).Info("No matching RT settings found for pod", "pod.name", pod.Name)
 	return nil, nil
 }
 
@@ -140,12 +140,12 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 	// Check if RT configuration is already applied or in progress
 	if pod.Annotations != nil {
 		if configured, exists := pod.Annotations["mckube.io/rt-configured"]; exists && configured == "true" {
-			log.Log.Info("RT configuration already completed, skipping", "pod", pod.Name)
+			log.Log.V(1).Info("RT configuration already completed, skipping", "pod", pod.Name)
 			return
 		}
 	}
 
-	log.Log.Info("Starting RT configuration scheduling", "pod", pod.Name, "namespace", pod.Namespace)
+	log.Log.V(1).Info("Starting RT configuration scheduling", "pod", pod.Name, "namespace", pod.Namespace)
 	
 	// Wait for pod to be scheduled and containers to be created
 	ticker := time.NewTicker(5 * time.Second)
@@ -167,6 +167,11 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 				Namespace: pod.Namespace,
 			}, updatedPod)
 			if err != nil {
+				// If pod is not found, it was likely deleted - stop trying
+				if strings.Contains(err.Error(), "not found") {
+					log.Log.V(1).Info("Pod was deleted, stopping RT configuration attempts", "pod", pod.Name)
+					return
+				}
 				log.Log.Error(err, "Failed to get pod status", "pod", pod.Name)
 				continue
 			}
@@ -178,6 +183,14 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 
 			if updatedPod.Status.Phase != corev1.PodRunning {
 				continue // Pod not running yet
+			}
+
+			// Check if RT settings are already configured
+			if updatedPod.Annotations != nil {
+				if configured, exists := updatedPod.Annotations["mckube.io/rt-configured"]; exists && configured == "true" {
+					log.Log.V(1).Info("RT settings already configured for pod", "pod", updatedPod.Name)
+					return // Already configured, no need to retry
+				}
 			}
 
 			// Apply RT settings via daemon on the node
@@ -277,7 +290,12 @@ func (m *PodMutator) updatePodRTAnnotation(ctx context.Context, pod *corev1.Pod,
 
 	err := m.client.Patch(ctx, pod, patch)
 	if err != nil {
-		log.Log.Error(err, "Failed to update pod annotation", "key", key, "value", value)
+		// Rate limit 에러인 경우 경고 로그만 출력
+		if strings.Contains(err.Error(), "rate limiter") || strings.Contains(err.Error(), "context canceled") {
+			log.Log.V(1).Info("Rate limit hit while updating pod annotation - this is expected under load", "key", key, "value", value)
+		} else {
+			log.Log.Error(err, "Failed to update pod annotation", "key", key, "value", value)
+		}
 	}
 }
 

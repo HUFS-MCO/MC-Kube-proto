@@ -59,6 +59,8 @@ type CgroupRequest struct {
 	Core        *string `json:"core,omitempty"`
 }
 
+// CgroupRequest는 Webhook에서 사용하므로 컨트롤러에서는 제거
+
 // Timers = (노드 이름 : taint 제거까지 남은 틱 수)
 var Timers = make(map[string]int)
 
@@ -188,68 +190,6 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: time.Second * 1}, nil
 	}
 
-	// RT 설정이 지정된 경우 적용
-	if rt.Spec.RTSettings != nil {
-		loggerHighPrio.Info("Checking if RT settings need to be applied", "podName", rt.Spec.PodName)
-
-		// 현재 상태 확인을 위해 먼저 Pod 조회
-		pod := &corev1.Pod{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err != nil {
-			if client.IgnoreNotFound(err) == nil {
-				loggerLowPrio.Info("Target pod not found yet. Will apply RT settings when pod is created.")
-				return ctrl.Result{RequeueAfter: time.Second * 5}, nil
-			}
-			logger.Error(err, "Failed to get target pod for RT settings")
-			return ctrl.Result{}, err
-		}
-
-		// Pod 상태에 따라 RT 설정 적용
-		switch pod.Status.Phase {
-		case corev1.PodPending:
-			// 컨테이너가 생성되었지만 아직 시작되지 않은 경우 확인
-			if len(pod.Status.ContainerStatuses) > 0 {
-				allHaveIDs := true
-				for _, cs := range pod.Status.ContainerStatuses {
-					if cs.ContainerID == "" {
-						allHaveIDs = false
-						break
-					}
-				}
-				if allHaveIDs {
-					loggerHighPrio.Info("Containers created but not running - applying RT settings", "podName", rt.Spec.PodName)
-					if err := r.applyRTSettings(ctx, rt); err != nil {
-						logger.Error(err, "Failed to apply RT settings during pending phase")
-						return ctrl.Result{RequeueAfter: time.Second * 5}, err
-					}
-					loggerHighPrio.Info("RT settings applied successfully during pending phase")
-				} else {
-					loggerLowPrio.Info("Containers not yet created. Requeuing...", "podName", rt.Spec.PodName)
-					return ctrl.Result{RequeueAfter: time.Second * 2}, nil
-				}
-			} else {
-				loggerLowPrio.Info("Pod pending but no container statuses yet. Requeuing...", "podName", rt.Spec.PodName)
-				return ctrl.Result{RequeueAfter: time.Second * 2}, nil
-			}
-		case corev1.PodRunning:
-			// 실행 중인 Pod의 경우, RT 설정이 적용되었는지 확인
-			// 이를 추적하기 위해 annotation을 추가할 수 있음
-			if pod.Annotations == nil || pod.Annotations["mckube.io/rt-applied"] != "true" {
-				loggerHighPrio.Info("Pod running but RT settings not applied yet", "podName", rt.Spec.PodName)
-				if err := r.applyRTSettings(ctx, rt); err != nil {
-					logger.Error(err, "Failed to apply RT settings to running pod")
-					return ctrl.Result{RequeueAfter: time.Second * 10}, err
-				}
-				loggerHighPrio.Info("RT settings applied to running pod")
-
-				// 적용 완료로 표시
-				if err := r.markRTSettingsApplied(ctx, pod); err != nil {
-					logger.Error(err, "Failed to mark RT settings as applied")
-				}
-			}
-		default:
-			loggerLowPrio.Info("Pod in non-applicable phase for RT settings", "phase", pod.Status.Phase)
-		}
-	}
 
 	loggerLowPrio.Info("Reconcile method finished")
 	return ctrl.Result{}, nil
@@ -934,7 +874,6 @@ func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	r.StartTaintThread()         // Taint 모니터링 스레드 시작
 	r.StartOverrunListener(8090) // Overrun 수신 포트 선언
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -977,98 +916,8 @@ func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Obj
 	return []reconcile.Request{}
 }
 
-// ===================== RT 설정 함수들 =====================
-
-// applyRTSettings() : 배포된 Pod의 컨테이너에 runtime, period, core 설정을 적용하는 함수
-func (r *McKubeReconciler) applyRTSettings(ctx context.Context, rt *mcoperatorv1.McKube) error {
-	logger := log.Log.WithValues("McKube/rt", rt.Name)
-
-	// 대상 Pod 조회
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err != nil {
-		return fmt.Errorf("failed to get target pod %s: %v", rt.Spec.PodName, err)
-	}
-
-	// Pod가 생성 되었는지 확인
-	if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodPending {
-		return fmt.Errorf("pod %s is not in a valid state for RT configuration: %s", rt.Spec.PodName, pod.Status.Phase)
-	}
-
-	// Pending 상태인 Pod에 대하여 생성될 때 까지 대기
-	if pod.Status.Phase == corev1.PodPending {
-		// Check if containers are created but not yet running
-		if len(pod.Status.ContainerStatuses) == 0 {
-			return fmt.Errorf("pod %s containers not yet created", rt.Spec.PodName)
-		}
-
-		// ID를 할당받지 못한 컨테이너가 있으면 대기
-		for _, containerStatus := range pod.Status.ContainerStatuses {
-			if containerStatus.ContainerID == "" {
-				return fmt.Errorf("pod %s containers not fully created yet", rt.Spec.PodName)
-			}
-		}
-	}
-
-	// 노드 IP 확인
-	nodeIP := pod.Status.HostIP
-	if nodeIP == "" {
-		return fmt.Errorf("node IP not available for pod %s", rt.Spec.PodName)
-	}
-
-	// 각 컨테이너에 RT 관련 설정 적용 (runtime, period, core)
-	for _, containerStatus := range pod.Status.ContainerStatuses {
-		if containerStatus.ContainerID == "" {
-			continue
-		}
-
-		req := CgroupRequest{
-			ContainerID: containerStatus.ContainerID,
-			Period:      rt.Spec.RTSettings.Period,
-			Runtime:     rt.Spec.RTSettings.Runtime,
-			Core:        rt.Spec.RTSettings.Core,
-		}
-
-		if err := r.sendRTRequest(nodeIP, req); err != nil {
-			logger.Error(err, "Failed to apply RT settings to container", "containerID", containerStatus.ContainerID)
-			return err
-		}
-
-		logger.Info("Successfully applied RT settings to container", "containerID", containerStatus.ContainerID)
-	}
-
-	return nil
-}
-
-// markRTSettingsApplied() : Pod에 RT 설정 적용 여부 annotation 추가
-func (r *McKubeReconciler) markRTSettingsApplied(ctx context.Context, pod *corev1.Pod) error {
-	if pod.Annotations == nil {
-		pod.Annotations = make(map[string]string)
-	}
-	pod.Annotations["mckube.io/rt-applied"] = "true"
-
-	return r.Update(ctx, pod)
-}
-
-// sendRTRequest() : Resource Daemon에 RT 관련 설정 요청을 보내는 함수
-func (r *McKubeReconciler) sendRTRequest(nodeIP string, req CgroupRequest) error {
-	reqBody, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %v", err)
-	}
-
-	url := fmt.Sprintf("http://%s:8080/cgroup", nodeIP)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return fmt.Errorf("failed to send request to %s: %v", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("RT daemon request failed with status: %d", resp.StatusCode)
-	}
-
-	return nil
-}
+// ===================== RT 설정 함수들은 Webhook에서 처리 =====================
+// 중복 처리 방지를 위해 컨트롤러에서는 RT 설정 관련 함수들을 제거
 
 // ===================== Overrun Listening Thread =====================
 
@@ -1227,4 +1076,25 @@ func (r *McKubeReconciler) findPodByContainerID(ctx context.Context, nodeName st
 	}
 
 	return nil, nil
+}
+
+// sendRTRequest sends RT configuration request to daemon
+func (r *McKubeReconciler) sendRTRequest(nodeIP string, req CgroupRequest) error {
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	url := fmt.Sprintf("http://%s:8080/cgroup", nodeIP)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to send request to %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("RT daemon request failed with status: %d", resp.StatusCode)
+	}
+
+	return nil
 }
