@@ -167,6 +167,11 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 				Namespace: pod.Namespace,
 			}, updatedPod)
 			if err != nil {
+				// If pod is not found, it was likely deleted - stop trying
+				if strings.Contains(err.Error(), "not found") {
+					log.Log.V(1).Info("Pod was deleted, stopping RT configuration attempts", "pod", pod.Name)
+					return
+				}
 				log.Log.Error(err, "Failed to get pod status", "pod", pod.Name)
 				continue
 			}
@@ -178,6 +183,14 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 
 			if updatedPod.Status.Phase != corev1.PodRunning {
 				continue // Pod not running yet
+			}
+
+			// Check if RT settings are already configured
+			if updatedPod.Annotations != nil {
+				if configured, exists := updatedPod.Annotations["mckube.io/rt-configured"]; exists && configured == "true" {
+					log.Log.V(1).Info("RT settings already configured for pod", "pod", updatedPod.Name)
+					return // Already configured, no need to retry
+				}
 			}
 
 			// Apply RT settings via daemon on the node
@@ -277,7 +290,12 @@ func (m *PodMutator) updatePodRTAnnotation(ctx context.Context, pod *corev1.Pod,
 
 	err := m.client.Patch(ctx, pod, patch)
 	if err != nil {
-		log.Log.Error(err, "Failed to update pod annotation", "key", key, "value", value)
+		// Rate limit 에러인 경우 경고 로그만 출력
+		if strings.Contains(err.Error(), "rate limiter") || strings.Contains(err.Error(), "context canceled") {
+			log.Log.V(1).Info("Rate limit hit while updating pod annotation - this is expected under load", "key", key, "value", value)
+		} else {
+			log.Log.Error(err, "Failed to update pod annotation", "key", key, "value", value)
+		}
 	}
 }
 

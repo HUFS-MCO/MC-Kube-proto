@@ -37,9 +37,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	mcoperatorv1 "mc-kube/api/v1"
-	"mc-kube/internal/controller"
-	mcwebhook "mc-kube/internal/webhook"
+	mcv1alpha1 "github.com/HUFS-MCO/MC-Kube-proto/api/v1alpha1"
+	"github.com/HUFS-MCO/MC-Kube-proto/internal/controller"
+	mcwebhook "github.com/HUFS-MCO/MC-Kube-proto/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -51,7 +51,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
-	utilruntime.Must(mcoperatorv1.AddToScheme(scheme))
+	utilruntime.Must(mcv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -74,7 +74,7 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
 		Development: true,
-		Level:       zapcore.Level(0),
+		Level: zapcore.Level(0),
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -149,10 +149,10 @@ func main() {
 	}
 
 	reconciler := &controller.McKubeReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		DynamicClient: dynamic.NewForConfigOrDie(mgr.GetConfig()),
-	}
+        Client: mgr.GetClient(),
+        Scheme: mgr.GetScheme(),
+        DynamicClient: dynamic.NewForConfigOrDie(mgr.GetConfig()),
+    }
 
 	if err = reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "McKube")
@@ -161,21 +161,9 @@ func main() {
 
 	// Setup webhook
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		setupLog.Info("Creating PodMutator instance")
 		podMutator := mcwebhook.NewPodMutator(mgr.GetClient())
-		if podMutator == nil {
-			setupLog.Error(nil, "PodMutator instance is nil!")
-			os.Exit(1)
-		}
-		setupLog.Info("PodMutator created successfully", "mutator", podMutator)
 		mgr.GetWebhookServer().Register("/mutate-v1-pod", &webhook.Admission{Handler: podMutator})
 		setupLog.Info("webhook registered", "path", "/mutate-v1-pod")
-
-		// Setup ValidatingWebhook
-		setupLog.Info("Creating RTValidator instance")
-		rtValidator := &mcwebhook.RTValidator{Client: mgr.GetClient()}
-		mgr.GetWebhookServer().Register("/validate-rt-pod", &webhook.Admission{Handler: rtValidator})
-		setupLog.Info("validating webhook registered", "path", "/validate-rt-pod")
 	}
 
 	// +kubebuilder:scaffold:builder
@@ -190,7 +178,7 @@ func main() {
 	}
 
 	setupLog.Info("starting thread for taint timeout McKube")
-	reconciler.StartTaintThread()
+    reconciler.StartTaintThread()
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
