@@ -62,14 +62,6 @@ func (v *RTValidator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod)
 	return nil, nil, nil
 }
 
-
-
-
-
-
-
-
-
 // validateRTSettings validates RT configuration parameters
 func (v *RTValidator) validateRTSettings(rtSettings *mcoperatorv1.RTSettings) error {
 	// Validate RT period (must be > 0)
@@ -77,19 +69,33 @@ func (v *RTValidator) validateRTSettings(rtSettings *mcoperatorv1.RTSettings) er
 		return fmt.Errorf("RT period must be positive, got: %d", rtSettings.Period)
 	}
 
-	// Validate RT runtime (must be > 0 and <= period)
-	if rtSettings.Runtime <= 0 {
-		return fmt.Errorf("RT runtime must be positive, got: %d", rtSettings.Runtime)
+	// Validate RT runtime_low (must be > 0 and <= period)
+	if rtSettings.RuntimeLow <= 0 {
+		return fmt.Errorf("RT runtime_low must be positive, got: %d", rtSettings.RuntimeLow)
 	}
 
-	if rtSettings.Runtime > rtSettings.Period {
-		return fmt.Errorf("RT runtime (%d) cannot be greater than period (%d)", rtSettings.Runtime, rtSettings.Period)
+	if rtSettings.RuntimeLow > rtSettings.Period {
+		return fmt.Errorf("RT runtime_low (%d) cannot be greater than period (%d)", rtSettings.RuntimeLow, rtSettings.Period)
 	}
 
-	// Validate RT runtime ratio (should not exceed 95% of period for safety)
+	// Validate RT runtime_hi (must be > 0 and <= period)
+	if rtSettings.RuntimeHi <= 0 {
+		return fmt.Errorf("RT runtime_hi must be positive, got: %d", rtSettings.RuntimeHi)
+	}
+
+	if rtSettings.RuntimeHi > rtSettings.Period {
+		return fmt.Errorf("RT runtime_hi (%d) cannot be greater than period (%d)", rtSettings.RuntimeHi, rtSettings.Period)
+	}
+
+	// Validate that runtime_low <= runtime_hi
+	if rtSettings.RuntimeLow > rtSettings.RuntimeHi {
+		return fmt.Errorf("RT runtime_low (%d) cannot be greater than runtime_hi (%d)", rtSettings.RuntimeLow, rtSettings.RuntimeHi)
+	}
+
+	// Validate RT runtime_hi ratio (should not exceed 95% of period for safety)
 	maxRuntime := int(float64(rtSettings.Period) * 0.95)
-	if rtSettings.Runtime > maxRuntime {
-		return fmt.Errorf("RT runtime (%d) exceeds 95%% of period (%d), max allowed: %d", rtSettings.Runtime, rtSettings.Period, maxRuntime)
+	if rtSettings.RuntimeHi > maxRuntime {
+		return fmt.Errorf("RT runtime_hi (%d) exceeds 95%% of period (%d), max allowed: %d", rtSettings.RuntimeHi, rtSettings.Period, maxRuntime)
 	}
 
 	// Core setting is optional, but if provided, should be valid format
@@ -103,4 +109,3 @@ func (v *RTValidator) validateRTSettings(rtSettings *mcoperatorv1.RTSettings) er
 
 	return nil
 }
-
