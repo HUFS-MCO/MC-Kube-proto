@@ -59,6 +59,10 @@ type CgroupRequest struct {
 	Core        *string `json:"core,omitempty"`
 }
 
+// Track pod runtime state (low or hi)
+var podRuntimeState = make(map[string]string) // podName -> "low" or "hi"
+var runtimeStateMutex sync.RWMutex
+
 // CgroupRequest는 Webhook에서 사용하므로 컨트롤러에서는 제거
 
 // Timers = (노드 이름 : taint 제거까지 남은 틱 수)
@@ -523,6 +527,128 @@ func (r *McKubeReconciler) handleNodeCPUPressure(ctx context.Context, nodeName s
 	r.processCurrentTier(ctx, logger, state, nodePods, rtData, podMilli, overSec, cpuUsage)
 }
 
+// handleCPURecovery() : CPU가 정상화되었을 때 (isCpuBusy=false) 모든 RT Pod를 runtime_low로 복귀시키는 함수
+func (r *McKubeReconciler) handleCPURecovery(ctx context.Context, nodeName string) {
+	logger := log.Log.WithValues("McKube/rt.CPURecovery", "Recovery", "node", nodeName)
+	logger.V(0).Info("CPU recovered (isCpuBusy=false), reverting pods to runtime_low")
+
+	// 노드의 pressure state 리셋
+	if _, exists := pressureState[nodeName]; exists {
+		logger.V(0).Info("Resetting node pressure state")
+		delete(pressureState, nodeName)
+	}
+
+	// 해당 노드의 모든 Pod 조회
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(targetNamespace)); err != nil {
+		logger.Error(err, "Failed to list pods", "namespace", targetNamespace)
+		return
+	}
+
+	var nodePods []*corev1.Pod
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if p.Spec.NodeName == nodeName {
+			// sdv.com 라벨이 있는 RT Pod만 처리
+			if p.Labels != nil && p.Labels["sdv.com"] != "" {
+				nodePods = append(nodePods, p)
+			}
+		}
+	}
+
+	if len(nodePods) == 0 {
+		logger.V(1).Info("No RT pods found on node")
+		return
+	}
+
+	logger.V(0).Info("Found RT pods to revert", "count", len(nodePods))
+
+	// 각 Pod에 대해 runtime_low로 복귀 처리
+	for _, pod := range nodePods {
+		// 현재 runtime 상태 확인
+		runtimeStateMutex.RLock()
+		currentState := podRuntimeState[pod.Name]
+		runtimeStateMutex.RUnlock()
+
+		if currentState != "hi" {
+			// 이미 low 상태이거나 설정되지 않음
+			logger.V(1).Info("Pod not in hi state, skipping", "pod", pod.Name)
+			continue
+		}
+
+		// McKube CR 조회
+		mckubeList := &mcoperatorv1.McKubeList{}
+		if err := r.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
+			logger.Error(err, "Failed to list McKube resources", "pod", pod.Name)
+			continue
+		}
+
+		var targetMcKube *mcoperatorv1.McKube
+		for i := range mckubeList.Items {
+			if mckubeList.Items[i].Spec.PodName == pod.Name {
+				targetMcKube = &mckubeList.Items[i]
+				break
+			}
+		}
+
+		if targetMcKube == nil || targetMcKube.Spec.RTSettings == nil {
+			logger.V(1).Info("No McKube CR or RT settings found for pod", "pod", pod.Name)
+			continue
+		}
+
+		// runtime_hi → runtime_low로 복귀
+		logger.V(0).Info("Reverting pod runtime from hi to low",
+			"pod", pod.Name,
+			"runtime_hi", targetMcKube.Spec.RTSettings.RuntimeHi,
+			"runtime_low", targetMcKube.Spec.RTSettings.RuntimeLow)
+
+		// 모든 컨테이너에 runtime_low 적용
+		nodeIP := pod.Status.HostIP
+		if nodeIP == "" {
+			logger.Error(fmt.Errorf("node IP not available"), "Failed to get node IP", "pod", pod.Name)
+			continue
+		}
+
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.ContainerID == "" {
+				continue
+			}
+
+			req := CgroupRequest{
+				ContainerID: cs.ContainerID,
+				Period:      targetMcKube.Spec.RTSettings.Period,
+				Runtime:     targetMcKube.Spec.RTSettings.RuntimeLow,
+				Core:        targetMcKube.Spec.RTSettings.Core,
+			}
+
+			if err := r.sendRTRequest(nodeIP, req); err != nil {
+				logger.Error(err, "Failed to apply runtime_low to container",
+					"containerID", cs.ContainerID,
+					"pod", pod.Name)
+				continue
+			}
+
+			logger.V(0).Info("Successfully reverted container to runtime_low",
+				"pod", pod.Name,
+				"container", cs.Name,
+				"runtime", targetMcKube.Spec.RTSettings.RuntimeLow)
+		}
+
+		// 상태 업데이트
+		runtimeStateMutex.Lock()
+		podRuntimeState[pod.Name] = "low"
+		runtimeStateMutex.Unlock()
+
+		// McKube CR 상태 업데이트
+		targetMcKube.Status.CurrentRuntime = "low"
+		if err := r.Status().Update(ctx, targetMcKube); err != nil {
+			logger.Error(err, "Failed to update McKube status", "pod", pod.Name)
+		}
+	}
+
+	logger.V(0).Info("CPU recovery completed", "podsReverted", len(nodePods))
+}
+
 // processCurrentTier() : 현재 Criticality 티어에 대해 다음의 로직을 수행
 //
 //  1. 90% 이상 지속 시간이 1초 이상인 경우
@@ -684,6 +810,15 @@ func (r *McKubeReconciler) findObjectsForNode(ctx context.Context, node client.O
 		return []reconcile.Request{}
 	}
 
+	// isCpuBusy 상태 확인
+	isCpuBusyStr := strings.TrimSpace(ann[annCpuBusyKey])
+	isCpuBusy := true // 기본값 true
+	if isCpuBusyStr != "" {
+		if busy, err := strconv.ParseBool(isCpuBusyStr); err == nil {
+			isCpuBusy = busy
+		}
+	}
+
 	// 이미 진행중인 노드라면 스킵
 	processingMutex.Lock()
 	if processingNodes[nodeObj.Name] {
@@ -694,9 +829,10 @@ func (r *McKubeReconciler) findObjectsForNode(ctx context.Context, node client.O
 	processingMutex.Unlock()
 
 	logger := log.Log.WithValues("McKube/rt.NodeEvent", "CPU-Event")
-	logger.V(0).Info("CPU annotation change detected, triggering adaptive control",
+	logger.V(0).Info("CPU annotation change detected",
 		"node", nodeObj.Name,
-		"cpu(%)", fmt.Sprintf("%.1f", cpuUsage))
+		"cpu(%)", fmt.Sprintf("%.1f", cpuUsage),
+		"isCpuBusy", isCpuBusy)
 
 	// CPU pressure 처리를 별도 Go Routine에서 비동기로 진행
 	go func() {
@@ -710,7 +846,14 @@ func (r *McKubeReconciler) findObjectsForNode(ctx context.Context, node client.O
 		// 백그라운드 처리를 위한 30초 타임아웃
 		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		r.handleNodeCPUPressure(bgCtx, nodeObj.Name)
+
+		// isCpuBusy=false인 경우: 모든 Pod를 runtime_low로 복귀
+		if !isCpuBusy {
+			r.handleCPURecovery(bgCtx, nodeObj.Name)
+		} else {
+			// isCpuBusy=true인 경우: 기존 CPU pressure 처리
+			r.handleNodeCPUPressure(bgCtx, nodeObj.Name)
+		}
 	}()
 
 	return []reconcile.Request{}
@@ -1012,6 +1155,31 @@ func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
 		"podPhase", pod.Status.Phase,
 		"timestamp", data.Timestamp)
 
+	// McKube CR 조회
+	mckubeList := &mcoperatorv1.McKubeList{}
+	if err := r.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
+		logger.Error(err, "Failed to list McKube resources")
+		return
+	}
+
+	var targetMcKube *mcoperatorv1.McKube
+	for i := range mckubeList.Items {
+		if mckubeList.Items[i].Spec.PodName == pod.Name {
+			targetMcKube = &mckubeList.Items[i]
+			break
+		}
+	}
+
+	if targetMcKube == nil {
+		logger.V(0).Info("No McKube CR found for pod", "podName", pod.Name)
+		return
+	}
+
+	if targetMcKube.Spec.RTSettings == nil {
+		logger.V(0).Info("Pod has no RT settings configured", "podName", pod.Name)
+		return
+	}
+
 	// Criticality 정보 로깅
 	if app, ok := pod.Labels["sdv.com"]; ok {
 		rtData, err := r.GetRealTimeData(ctx)
@@ -1025,6 +1193,61 @@ func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
 			}
 		}
 	}
+
+	// 현재 runtime 상태 확인
+	runtimeStateMutex.RLock()
+	currentState := podRuntimeState[pod.Name]
+	runtimeStateMutex.RUnlock()
+
+	if currentState == "hi" {
+		logger.V(0).Info("Pod already using runtime_hi, no action needed",
+			"podName", pod.Name)
+		return
+	}
+
+	// runtime_low에서 runtime_hi로 변경
+	logger.V(0).Info("Escalating pod runtime from low to hi due to overrun",
+		"podName", pod.Name,
+		"runtime_low", targetMcKube.Spec.RTSettings.RuntimeLow,
+		"runtime_hi", targetMcKube.Spec.RTSettings.RuntimeHi)
+
+	// 컨테이너에 runtime_hi 적용
+	nodeIP := pod.Status.HostIP
+	if nodeIP == "" {
+		logger.Error(fmt.Errorf("node IP not available"), "Failed to get node IP for pod", "podName", pod.Name)
+		return
+	}
+
+	req := CgroupRequest{
+		ContainerID: data.ContainerID,
+		Period:      targetMcKube.Spec.RTSettings.Period,
+		Runtime:     targetMcKube.Spec.RTSettings.RuntimeHi,
+		Core:        targetMcKube.Spec.RTSettings.Core,
+	}
+
+	if err := r.sendRTRequest(nodeIP, req); err != nil {
+		logger.Error(err, "Failed to apply runtime_hi to container",
+			"containerID", data.ContainerID,
+			"podName", pod.Name)
+		return
+	}
+
+	// 상태 업데이트
+	runtimeStateMutex.Lock()
+	podRuntimeState[pod.Name] = "hi"
+	runtimeStateMutex.Unlock()
+
+	// McKube CR 상태 업데이트
+	now := metav1.Now()
+	targetMcKube.Status.CurrentRuntime = "hi"
+	targetMcKube.Status.LastOverrunTime = &now
+	if err := r.Status().Update(ctx, targetMcKube); err != nil {
+		logger.Error(err, "Failed to update McKube status", "podName", pod.Name)
+	}
+
+	logger.V(0).Info("Successfully escalated pod runtime to hi",
+		"podName", pod.Name,
+		"newRuntime", targetMcKube.Spec.RTSettings.RuntimeHi)
 }
 
 // findPodByContainerID() : 특정 노드에서 컨테이너 ID로 파드를 찾는 함수
