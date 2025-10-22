@@ -190,7 +190,6 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: time.Second * 1}, nil
 	}
 
-
 	loggerLowPrio.Info("Reconcile method finished")
 	return ctrl.Result{}, nil
 }
@@ -892,6 +891,12 @@ func (r *McKubeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // findObjectsForPod() : 파드가 생성된 네임스페이스의 McKube 관련 CR을 찾아 Reconcile 요청을 생성하는 함수
 func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Object) []reconcile.Request {
 	if pod.GetNamespace() != targetNamespace {
+		return []reconcile.Request{}
+	}
+
+	// sdv.com 라벨 체크 - RT 워크로드가 아니면 처리하지 않음
+	labels := pod.GetLabels()
+	if labels == nil || labels["sdv.com"] == "" {
 		return []reconcile.Request{}
 	}
 
