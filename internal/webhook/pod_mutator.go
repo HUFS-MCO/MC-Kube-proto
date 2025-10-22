@@ -25,21 +25,21 @@ type PodMutator struct {
 
 func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	log.Log.V(1).Info("=== Webhook Handle called ===", "pod.name", req.Name, "pod.namespace", req.Namespace)
-	
+
 	// Check if receiver m is nil
 	if m == nil {
 		log.Log.Error(fmt.Errorf("PodMutator receiver is nil"), "PodMutator receiver (m) is nil")
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("internal error: PodMutator receiver is nil"))
 	}
 	log.Log.V(1).Info("PodMutator receiver is not nil", "mutator", m)
-	
+
 	// Nil check for client
 	if m.client == nil {
 		log.Log.Error(fmt.Errorf("client is nil"), "PodMutator client is nil")
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("internal error: client is nil"))
 	}
 	log.Log.V(1).Info("Client is not nil", "client", m.client)
-	
+
 	pod := &corev1.Pod{}
 
 	err := json.Unmarshal(req.Object.Raw, pod)
@@ -80,16 +80,18 @@ func (m *PodMutator) Handle(ctx context.Context, req admission.Request) admissio
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
-	
+
 	// Check if RT configuration is already pending or configured
 	if pod.Annotations["mckube.io/rt-pending"] == "true" || pod.Annotations["mckube.io/rt-configured"] == "true" {
 		log.Log.V(1).Info("RT configuration already in progress or completed", "pod.name", pod.Name)
 		return admission.Allowed("RT configuration already handled")
 	}
-	
+
 	pod.Annotations["mckube.io/rt-pending"] = "true"
 	pod.Annotations["mckube.io/rt-period"] = fmt.Sprintf("%d", rtSettings.Period)
-	pod.Annotations["mckube.io/rt-runtime"] = fmt.Sprintf("%d", rtSettings.Runtime)
+	pod.Annotations["mckube.io/rt-runtime-low"] = fmt.Sprintf("%d", rtSettings.RuntimeLow)
+	pod.Annotations["mckube.io/rt-runtime-hi"] = fmt.Sprintf("%d", rtSettings.RuntimeHi)
+	pod.Annotations["mckube.io/rt-current"] = "low" // 초기에는 runtime_low 사용
 	if rtSettings.Core != nil {
 		pod.Annotations["mckube.io/rt-core"] = *rtSettings.Core
 	}
@@ -109,13 +111,13 @@ func (m *PodMutator) findRTSettingsForPod(ctx context.Context, pod *corev1.Pod) 
 	if m.client == nil {
 		return nil, fmt.Errorf("client is nil")
 	}
-	
+
 	if pod == nil {
 		return nil, fmt.Errorf("pod is nil")
 	}
-	
+
 	log.Log.V(1).Info("Finding RT settings for pod", "pod.name", pod.Name, "pod.namespace", pod.Namespace)
-	
+
 	mckubeList := &mcoperatorv1.McKubeList{}
 	if err := m.client.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
 		log.Log.Error(err, "Failed to list McKube resources")
@@ -146,7 +148,7 @@ func (m *PodMutator) scheduleRTConfiguration(ctx context.Context, pod *corev1.Po
 	}
 
 	log.Log.V(1).Info("Starting RT configuration scheduling", "pod", pod.Name, "namespace", pod.Namespace)
-	
+
 	// Wait for pod to be scheduled and containers to be created
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -249,7 +251,7 @@ func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.P
 	requestBody := map[string]interface{}{
 		"container_id": containerID,
 		"period":       rtSettings.Period,
-		"runtime":      rtSettings.Runtime,
+		"runtime":      rtSettings.RuntimeLow, // 초기에는 runtime_low 사용
 	}
 
 	if rtSettings.Core != nil {

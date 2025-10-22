@@ -41,15 +41,21 @@ type McKubeSpec struct {
 
 // RTSettings defines RT cgroup configuration
 type RTSettings struct {
-	Period  int     `json:"period"`         // RT period in microseconds
-	Runtime int     `json:"runtime"`        // RT runtime in microseconds
-	Core    *string `json:"core,omitempty"` // CPU core range (e.g., "2-3")
+	Period     int     `json:"period"`         // RT period in microseconds
+	RuntimeLow int     `json:"runtime_low"`    // Initial conservative RT runtime in microseconds
+	RuntimeHi  int     `json:"runtime_hi"`     // Elevated RT runtime after overrun detection in microseconds
+	Core       *string `json:"core,omitempty"` // CPU core range (e.g., "2-3")
 }
 
 // McKubeStatus defines the observed state of McKube
 type McKubeStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// CurrentRuntime tracks whether the pod is using runtime_low or runtime_hi
+	CurrentRuntime string `json:"currentRuntime,omitempty"` // "low" or "hi"
+	// LastOverrunTime tracks when the last overrun was detected
+	LastOverrunTime *metav1.Time `json:"lastOverrunTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -7,9 +7,10 @@ spec:
   podname: "rt-test-pod"
   criticality: "high"
   rtSettings:
-    period: 1000000     # 1 second in microseconds
-    runtime: 500000     # 500ms runtime
-    core: "2-3"         # Use cores 2-3
+    period: 1000000        # 1 second in microseconds
+    runtime_low: 300000    # 300ms initial runtime (conservative)
+    runtime_hi: 500000     # 500ms elevated runtime (after overrun detection)
+    core: "2-3"            # Use cores 2-3
 ---
 apiVersion: v1
 kind: Pod
