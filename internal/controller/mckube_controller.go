@@ -72,10 +72,11 @@ var Timers = make(map[string]int)
 const polling_rate = 10
 
 // Criticality 순서: A < B < C
+// Criticality 순서: Low < Middle < High
 var criticalityRank = map[string]int{
-	"A": 0,
-	"B": 1,
-	"C": 2,
+	"Low":    0,
+	"Middle": 1,
+	"High":   2,
 }
 
 const targetNamespace = "default"
@@ -124,6 +125,36 @@ type OverrunData struct {
 	ContainerID string `json:"container_id"`        // required
 	Timestamp   int64  `json:"timestamp,omitempty"` // optional
 }
+
+// ===================== CPU Pool 관리를 위한 데이터 구조 =====================
+// CPUCoreInfo: 각 CPU 코어의 사용 정보
+type CPUCoreInfo struct {
+	CoreID      int                // CPU 코어 번호
+	UsageMillis int64              // 현재 할당된 CPU 사용량 (밀리코어)
+	Pods        map[string]PodInfo // 이 코어에 할당된 Pod 정보 (podName -> PodInfo)
+}
+
+// PodInfo: Pod의 할당 정보
+type PodInfo struct {
+	Name        string
+	Namespace   string
+	Criticality string // "Low", "Middle", "High"
+	CPUMillis   int64  // 할당된 CPU 양 (밀리코어, RT 설정의 runtime/period 기반)
+	CoreSet     []int  // 할당된 코어 번호들
+}
+
+// CPUPool: 노드별 CPU 코어 풀 관리
+type CPUPool struct {
+	NodeName string
+	Cores    map[int]*CPUCoreInfo // coreID -> CPUCoreInfo
+	mu       sync.RWMutex
+}
+
+// CPU Pool 저장소 (nodeName -> CPUPool)
+var cpuPools = make(map[string]*CPUPool)
+var cpuPoolsMutex sync.RWMutex
+
+const coreUtilizationThreshold = 0.9 // 90% 임계값
 
 var pressureState = make(map[string]*NodePressureState)
 
@@ -192,6 +223,65 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		loggerHighPrio.Info("McKube resource updated with Node name. Requeuing to process...")
 		return ctrl.Result{RequeueAfter: time.Second * 1}, nil
+	}
+
+	// Pod가 스케줄링되고 RT 설정이 있으면 선점 체크 및 CPU Pool 업데이트
+	if rt.Spec.RTSettings != nil {
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err == nil {
+			// Pod가 노드에 할당되었고 Pending 또는 Running 상태면 처리
+			if pod.Spec.NodeName != "" && (pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning) {
+				
+				if rt.Spec.RTSettings.Core != nil {
+					targetCores := parseCoreSet(*rt.Spec.RTSettings.Core)
+					
+					// RT 설정 기반 CPU 사용량 계산
+					runtimeStateMutex.RLock()
+					currentRuntimeState := podRuntimeState[pod.Name]
+					runtimeStateMutex.RUnlock()
+
+					var effectiveRuntime int
+					if currentRuntimeState == "hi" {
+						effectiveRuntime = rt.Spec.RTSettings.RuntimeHi
+					} else {
+						effectiveRuntime = rt.Spec.RTSettings.RuntimeLow
+					}
+
+					cpuMillis := int64(0)
+					if rt.Spec.RTSettings.Period > 0 {
+						cpuMillis = int64(float64(effectiveRuntime) / float64(rt.Spec.RTSettings.Period) * 1000.0)
+					}
+					if cpuMillis == 0 {
+						cpuMillis = 100 // 기본값
+					}
+
+					criticality := rt.Spec.Criticality
+
+					// 선점 체크 먼저 수행 (CPU Pool에 추가하기 전)
+					loggerHighPrio.Info("Checking preemption for pod",
+						"pod", pod.Name,
+						"cores", targetCores,
+						"cpuMillis", cpuMillis,
+						"criticality", criticality)
+
+					if err := r.checkAndPreemptForPod(ctx, pod, targetCores, cpuMillis, criticality); err != nil {
+						logger.Error(err, "Failed to check preemption for pod", "pod", pod.Name)
+					}
+				}
+
+				// 선점 체크 후 CPU Pool 업데이트
+				if err := r.updateCPUPoolForPod(ctx, pod, rt); err != nil {
+					logger.Error(err, "Failed to update CPU pool for pod", "pod", pod.Name)
+				}
+
+				// RT 설정을 컨테이너에 적용
+				if pod.Status.Phase == corev1.PodRunning {
+					if err := r.applyRTSettingsToContainers(ctx, pod, rt); err != nil {
+						logger.Error(err, "Failed to apply RT settings to containers", "pod", pod.Name)
+					}
+				}
+			}
+		}
 	}
 
 	loggerLowPrio.Info("Reconcile method finished")
@@ -1347,6 +1437,510 @@ func (r *McKubeReconciler) sendRTRequest(nodeIP string, req CgroupRequest) error
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("RT daemon request failed with status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// ===================== CPU Pool 관리 함수들 =====================
+
+// getOrCreateCPUPool: 노드에 대한 CPU Pool을 가져오거나 생성
+func getOrCreateCPUPool(nodeName string, numCores int) *CPUPool {
+	cpuPoolsMutex.Lock()
+	defer cpuPoolsMutex.Unlock()
+
+	if pool, exists := cpuPools[nodeName]; exists {
+		return pool
+	}
+
+	pool := &CPUPool{
+		NodeName: nodeName,
+		Cores:    make(map[int]*CPUCoreInfo),
+	}
+
+	// 초기화: 모든 코어 생성
+	for i := 0; i < numCores; i++ {
+		pool.Cores[i] = &CPUCoreInfo{
+			CoreID:      i,
+			UsageMillis: 0,
+			Pods:        make(map[string]PodInfo),
+		}
+	}
+
+	cpuPools[nodeName] = pool
+	return pool
+}
+
+// getCoreUtilization: 특정 코어의 사용률 계산 (0.0 ~ 1.0)
+func (p *CPUPool) getCoreUtilization(coreID int) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	core, exists := p.Cores[coreID]
+	if !exists {
+		return 0.0
+	}
+
+	// 1000 millis = 1 core = 100%
+	return float64(core.UsageMillis) / 1000.0
+}
+
+// addPodToCore: 코어에 Pod 할당 정보 추가
+func (p *CPUPool) addPodToCore(coreID int, pod PodInfo) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if core, exists := p.Cores[coreID]; exists {
+		core.Pods[pod.Name] = pod
+		core.UsageMillis += pod.CPUMillis
+	}
+}
+
+// removePodFromCore: 코어에서 Pod 할당 정보 제거
+func (p *CPUPool) removePodFromCore(coreID int, podName string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if core, exists := p.Cores[coreID]; exists {
+		if pod, found := core.Pods[podName]; found {
+			core.UsageMillis -= pod.CPUMillis
+			delete(core.Pods, podName)
+		}
+	}
+}
+
+// getPodsOnCore: 특정 코어에 할당된 Pod 목록 반환
+func (p *CPUPool) getPodsOnCore(coreID int) []PodInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	core, exists := p.Cores[coreID]
+	if !exists {
+		return nil
+	}
+
+	pods := make([]PodInfo, 0, len(core.Pods))
+	for _, pod := range core.Pods {
+		pods = append(pods, pod)
+	}
+	return pods
+}
+
+// findLeastLoadedCore: 가장 사용률이 낮은 코어 찾기
+func (p *CPUPool) findLeastLoadedCore() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	minCore := -1
+	minUsage := int64(1<<63 - 1)
+
+	for coreID, core := range p.Cores {
+		if core.UsageMillis < minUsage {
+			minUsage = core.UsageMillis
+			minCore = coreID
+		}
+	}
+
+	return minCore
+}
+
+// ===================== 선점(Preemption) 로직 =====================
+
+// checkAndPreemptForPod: Pod 할당 전 선점 필요 여부 확인 및 실행
+// High criticality: Middle/Low를 선점 가능
+// Middle criticality: Low를 선점 가능
+func (r *McKubeReconciler) checkAndPreemptForPod(ctx context.Context, pod *corev1.Pod, targetCores []int, cpuMillis int64, criticality string) error {
+	logger := log.Log.WithValues("McKube/rt.Preemption", "Check")
+
+	nodeName := pod.Spec.NodeName
+	if nodeName == "" {
+		return fmt.Errorf("pod has no assigned node")
+	}
+
+	// 노드의 CPU Pool 가져오기
+	cpuPoolsMutex.RLock()
+	pool, exists := cpuPools[nodeName]
+	cpuPoolsMutex.RUnlock()
+
+	if !exists {
+		logger.V(1).Info("No CPU pool for node, skipping preemption check", "node", nodeName)
+		return nil
+	}
+
+	// 각 타겟 코어에 대해 선점 필요 여부 확인
+	for _, coreID := range targetCores {
+		// 할당 후 예상 사용률 계산
+		currentUsage := pool.getCoreUtilization(coreID)
+		afterUsage := currentUsage + float64(cpuMillis)/1000.0
+
+		logger.V(0).Info("Core utilization check",
+			"core", coreID,
+			"currentUsage", fmt.Sprintf("%.2f%%", currentUsage*100),
+			"afterUsage", fmt.Sprintf("%.2f%%", afterUsage*100),
+			"threshold", fmt.Sprintf("%.2f%%", coreUtilizationThreshold*100))
+
+		// 90% 임계값 초과 시 선점 시도
+		if afterUsage > coreUtilizationThreshold {
+			logger.V(0).Info("Core utilization will exceed threshold, attempting preemption",
+				"core", coreID,
+				"pod", pod.Name,
+				"criticality", criticality)
+
+			victims := r.findPreemptionVictims(pool, coreID, criticality)
+			if len(victims) > 0 {
+				logger.V(0).Info("Found preemption victims",
+					"core", coreID,
+					"victimCount", len(victims))
+
+				for _, victim := range victims {
+					if err := r.preemptPod(ctx, victim, pool, coreID); err != nil {
+						logger.Error(err, "Failed to preempt victim pod",
+							"victim", victim.Name,
+							"core", coreID)
+					} else {
+						logger.V(0).Info("Successfully preempted victim pod",
+							"victim", victim.Name,
+							"victimCriticality", victim.Criticality,
+							"preemptor", pod.Name,
+							"preemptorCriticality", criticality,
+							"core", coreID)
+					}
+				}
+			} else {
+				logger.V(0).Info("No preemptable victims found on core",
+					"core", coreID,
+					"criticality", criticality)
+			}
+		}
+	}
+
+	return nil
+}
+
+// findPreemptionVictims: 선점 가능한 Pod들을 찾음
+// High는 Middle, Low를 선점 가능
+// Middle은 Low를 선점 가능
+func (r *McKubeReconciler) findPreemptionVictims(pool *CPUPool, coreID int, preemptorCriticality string) []PodInfo {
+	pods := pool.getPodsOnCore(coreID)
+	victims := make([]PodInfo, 0)
+
+	preemptorRank := criticalityRank[preemptorCriticality]
+
+	for _, pod := range pods {
+		victimRank := criticalityRank[pod.Criticality]
+
+		// 선점자의 우선순위가 피해자보다 높으면(rank가 크면) 선점 가능
+		if preemptorRank > victimRank {
+			victims = append(victims, pod)
+		}
+	}
+
+	return victims
+}
+
+// preemptPod: Pod를 선점하여 다른 코어로 이동 또는 evict
+func (r *McKubeReconciler) preemptPod(ctx context.Context, victim PodInfo, pool *CPUPool, currentCore int) error {
+	logger := log.Log.WithValues("McKube/rt.Preemption", "Evict")
+
+	logger.V(0).Info("Preempting pod from core",
+		"pod", victim.Name,
+		"namespace", victim.Namespace,
+		"criticality", victim.Criticality,
+		"core", currentCore)
+
+	// Pod 객체 가져오기
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      victim.Name,
+		Namespace: victim.Namespace,
+	}, pod); err != nil {
+		return fmt.Errorf("failed to get victim pod: %v", err)
+	}
+
+	// Step 1: CPU Pool에서 현재 코어에서 제거
+	pool.removePodFromCore(currentCore, victim.Name)
+
+	// Step 2: 다른 코어로 이동 시도
+	newCore := pool.findLeastLoadedCore()
+	newCoreUsage := pool.getCoreUtilization(newCore)
+
+	logger.V(0).Info("Attempting to migrate pod to different core",
+		"pod", victim.Name,
+		"fromCore", currentCore,
+		"toCore", newCore,
+		"newCoreUsage", fmt.Sprintf("%.2f%%", newCoreUsage*100))
+
+	// 새 코어에 공간이 있으면 이동
+	if newCoreUsage+float64(victim.CPUMillis)/1000.0 <= coreUtilizationThreshold {
+		pool.addPodToCore(newCore, victim)
+
+		// Pod의 RT 설정 업데이트 (코어 변경)
+		if err := r.updatePodCoreAffinity(ctx, pod, newCore); err != nil {
+			logger.Error(err, "Failed to update pod core affinity",
+				"pod", victim.Name,
+				"newCore", newCore)
+			return err
+		}
+
+		logger.V(0).Info("Successfully migrated pod to different core",
+			"pod", victim.Name,
+			"fromCore", currentCore,
+			"toCore", newCore)
+
+		return nil
+	}
+
+	// Step 3: 이동할 공간이 없으면 evict
+	logger.V(0).Info("No available core for migration, evicting pod",
+		"pod", victim.Name,
+		"criticality", victim.Criticality)
+
+	return r.evictPod(ctx, pod)
+}
+
+// updatePodCoreAffinity: Pod의 CPU 코어 어피니티 업데이트
+func (r *McKubeReconciler) updatePodCoreAffinity(ctx context.Context, pod *corev1.Pod, newCore int) error {
+	logger := log.Log.WithValues("McKube/rt.CoreUpdate", "Affinity")
+
+	// McKube CR 조회
+	mckubeList := &mcoperatorv1.McKubeList{}
+	if err := r.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
+		return fmt.Errorf("failed to list McKube resources: %v", err)
+	}
+
+	var targetMcKube *mcoperatorv1.McKube
+	for i := range mckubeList.Items {
+		if mckubeList.Items[i].Spec.PodName == pod.Name {
+			targetMcKube = &mckubeList.Items[i]
+			break
+		}
+	}
+
+	if targetMcKube == nil || targetMcKube.Spec.RTSettings == nil {
+		logger.V(1).Info("No McKube CR or RT settings found for pod", "pod", pod.Name)
+		return nil
+	}
+
+	// Core 설정 업데이트
+	newCoreStr := fmt.Sprintf("%d", newCore)
+	targetMcKube.Spec.RTSettings.Core = &newCoreStr
+
+	if err := r.Update(ctx, targetMcKube); err != nil {
+		return fmt.Errorf("failed to update McKube CR: %v", err)
+	}
+
+	logger.V(0).Info("Updated pod core affinity",
+		"pod", pod.Name,
+		"newCore", newCore)
+
+	// RT 데몬에 새 코어 설정 전송
+	nodeIP := pod.Status.HostIP
+	if nodeIP == "" {
+		return fmt.Errorf("node IP not available")
+	}
+
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.ContainerID == "" {
+			continue
+		}
+
+		req := CgroupRequest{
+			ContainerID: cs.ContainerID,
+			Period:      targetMcKube.Spec.RTSettings.Period,
+			Runtime:     targetMcKube.Spec.RTSettings.RuntimeLow,
+			Core:        &newCoreStr,
+		}
+
+		if err := r.sendRTRequest(nodeIP, req); err != nil {
+			logger.Error(err, "Failed to apply new core to container",
+				"containerID", cs.ContainerID,
+				"pod", pod.Name)
+			continue
+		}
+	}
+
+	return nil
+}
+
+// ===================== 헬퍼 함수들 =====================
+
+// parseCoreSet: 코어 범위 문자열을 파싱하여 코어 번호 배열로 변환
+// 예: "2-3" -> [2, 3], "1" -> [1], "0,2,4" -> [0, 2, 4]
+func parseCoreSet(coreStr string) []int {
+	cores := make([]int, 0)
+
+	// 쉼표로 분리
+	parts := strings.Split(coreStr, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+
+		// 범위 체크 (예: "2-3")
+		if strings.Contains(part, "-") {
+			rangeParts := strings.Split(part, "-")
+			if len(rangeParts) == 2 {
+				start := 0
+				end := 0
+				fmt.Sscanf(rangeParts[0], "%d", &start)
+				fmt.Sscanf(rangeParts[1], "%d", &end)
+
+				for i := start; i <= end; i++ {
+					cores = append(cores, i)
+				}
+			}
+		} else {
+			// 단일 코어
+			coreID := 0
+			if _, err := fmt.Sscanf(part, "%d", &coreID); err == nil {
+				cores = append(cores, coreID)
+			}
+		}
+	}
+
+	return cores
+}
+
+// getPodCPUMillis: Pod의 CPU 요청량을 밀리코어로 반환
+func (r *McKubeReconciler) getPodCPUMillis(pod *corev1.Pod) int64 {
+	totalMillis := int64(0)
+
+	for _, container := range pod.Spec.Containers {
+		if container.Resources.Requests != nil {
+			if cpu := container.Resources.Requests.Cpu(); cpu != nil {
+				totalMillis += cpu.MilliValue()
+			}
+		}
+	}
+
+	// 최소값 보장
+	if totalMillis == 0 {
+		totalMillis = 100 // 기본값 100m
+	}
+
+	return totalMillis
+}
+
+// updateCPUPoolForPod: Pod 정보를 CPU Pool에 업데이트
+func (r *McKubeReconciler) updateCPUPoolForPod(ctx context.Context, pod *corev1.Pod, mckube *mcoperatorv1.McKube) error {
+	if mckube.Spec.RTSettings == nil || mckube.Spec.RTSettings.Core == nil {
+		return nil
+	}
+
+	nodeName := pod.Spec.NodeName
+	if nodeName == "" {
+		return fmt.Errorf("pod has no assigned node")
+	}
+
+	// CPU Pool 가져오기 또는 생성 (기본 8코어로 가정, 실제로는 노드 정보에서 가져와야 함)
+	pool := getOrCreateCPUPool(nodeName, 8)
+
+	// RT 설정을 기반으로 CPU 사용량 계산
+	// Runtime과 Period를 사용하여 실제 CPU 사용률 추정
+	// CPU 사용량 (millis) = (runtime / period) * 1000
+	// 현재 runtime 상태 확인
+	runtimeStateMutex.RLock()
+	currentRuntimeState := podRuntimeState[pod.Name]
+	runtimeStateMutex.RUnlock()
+
+	var effectiveRuntime int
+	if currentRuntimeState == "hi" {
+		effectiveRuntime = mckube.Spec.RTSettings.RuntimeHi
+	} else {
+		effectiveRuntime = mckube.Spec.RTSettings.RuntimeLow
+	}
+
+	// CPU 사용량 계산: (runtime_us / period_us) * 1000 millis
+	cpuMillis := int64(0)
+	if mckube.Spec.RTSettings.Period > 0 {
+		cpuMillis = int64(float64(effectiveRuntime) / float64(mckube.Spec.RTSettings.Period) * 1000.0)
+	}
+
+	// 최소값 보장
+	if cpuMillis == 0 {
+		cpuMillis = 100 // 기본값 100m
+	}
+
+	// Pod 정보 생성
+	podInfo := PodInfo{
+		Name:        pod.Name,
+		Namespace:   pod.Namespace,
+		Criticality: mckube.Spec.Criticality,
+		CPUMillis:   cpuMillis,
+		CoreSet:     parseCoreSet(*mckube.Spec.RTSettings.Core),
+	}
+
+	// 각 코어에 Pod 추가 (이미 있으면 업데이트)
+	for _, coreID := range podInfo.CoreSet {
+		// 기존에 있으면 제거 후 재추가 (업데이트)
+		pool.removePodFromCore(coreID, pod.Name)
+		pool.addPodToCore(coreID, podInfo)
+	}
+
+	log.Log.V(0).Info("Updated CPU pool for pod",
+		"pod", pod.Name,
+		"node", nodeName,
+		"cores", podInfo.CoreSet,
+		"cpuMillis", cpuMillis,
+		"runtime", effectiveRuntime,
+		"period", mckube.Spec.RTSettings.Period,
+		"criticality", podInfo.Criticality)
+
+	return nil
+}
+
+// applyRTSettingsToContainers applies RT cgroup settings to all containers in a pod
+func (r *McKubeReconciler) applyRTSettingsToContainers(ctx context.Context, pod *corev1.Pod, mckube *mcoperatorv1.McKube) error {
+	logger := log.Log.WithValues("McKube/rt.RTSettings", "Apply")
+
+	if mckube.Spec.RTSettings == nil {
+		return nil
+	}
+
+	nodeIP := pod.Status.HostIP
+	if nodeIP == "" {
+		return fmt.Errorf("node IP not available")
+	}
+
+	// 현재 runtime 상태 확인
+	runtimeStateMutex.RLock()
+	currentRuntimeState := podRuntimeState[pod.Name]
+	runtimeStateMutex.RUnlock()
+
+	var effectiveRuntime int
+	if currentRuntimeState == "hi" {
+		effectiveRuntime = mckube.Spec.RTSettings.RuntimeHi
+	} else {
+		effectiveRuntime = mckube.Spec.RTSettings.RuntimeLow
+	}
+
+	// 모든 컨테이너에 RT 설정 적용
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.ContainerID == "" {
+			continue
+		}
+
+		req := CgroupRequest{
+			ContainerID: cs.ContainerID,
+			Period:      mckube.Spec.RTSettings.Period,
+			Runtime:     effectiveRuntime,
+			Core:        mckube.Spec.RTSettings.Core,
+		}
+
+		if err := r.sendRTRequest(nodeIP, req); err != nil {
+			logger.Error(err, "Failed to apply RT settings to container",
+				"containerID", cs.ContainerID,
+				"pod", pod.Name,
+				"runtime", effectiveRuntime,
+				"period", mckube.Spec.RTSettings.Period,
+				"core", *mckube.Spec.RTSettings.Core)
+			return err
+		}
+
+		logger.V(0).Info("Applied RT settings to container",
+			"pod", pod.Name,
+			"container", cs.Name,
+			"runtime", effectiveRuntime,
+			"period", mckube.Spec.RTSettings.Period,
+			"core", *mckube.Spec.RTSettings.Core)
 	}
 
 	return nil

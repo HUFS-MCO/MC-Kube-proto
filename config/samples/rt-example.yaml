@@ -5,7 +5,7 @@ metadata:
   namespace: default
 spec:
   podname: "rt-test-pod"
-  criticality: "high"
+  criticality: "High"
   rtSettings:
     period: 1000000        # 1 second in microseconds
     runtime_low: 300000    # 300ms initial runtime (conservative)

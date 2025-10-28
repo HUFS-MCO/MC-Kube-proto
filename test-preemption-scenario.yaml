@@ -1,0 +1,85 @@
+# 선점 테스트 시나리오
+# Core 2에 Middle과 Low Pod를 먼저 배치한 후, High Pod가 들어오면 선점이 발생하는지 테스트
+
+---
+# Step 1: Middle criticality Pod (Core 2에 할당, 40% CPU 사용)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: middle-pod
+  namespace: default
+  labels:
+    sdv.com: middle-app
+spec:
+  containers:
+  - name: app
+    image: nginx:latest
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: middle-pod-config
+  namespace: default
+spec:
+  podname: middle-pod
+  criticality: "Middle"
+  rtSettings:
+    period: 100000        # 100ms
+    runtime_low: 40000    # 40ms → 40% CPU
+    runtime_hi: 60000     # 60ms → 60% CPU
+    core: "2"             # Core 2에 할당
+---
+# Step 2: Low criticality Pod (Core 2에 할당, 35% CPU 사용)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: low-pod
+  namespace: default
+  labels:
+    sdv.com: low-app
+spec:
+  containers:
+  - name: app
+    image: nginx:latest
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: low-pod-config
+  namespace: default
+spec:
+  podname: low-pod
+  criticality: "Low"
+  rtSettings:
+    period: 100000        # 100ms
+    runtime_low: 35000    # 35ms → 35% CPU
+    runtime_hi: 50000     # 50ms → 50% CPU
+    core: "2"             # Core 2에 할당
+---
+# Step 3: High criticality Pod (Core 2에 할당 시도, 25% CPU 사용)
+# 이 Pod가 배치되면 Core 2가 100% (40% + 35% + 25%)가 되므로 선점 발생!
+apiVersion: v1
+kind: Pod
+metadata:
+  name: high-pod
+  namespace: default
+  labels:
+    sdv.com: high-app
+spec:
+  containers:
+  - name: app
+    image: nginx:latest
+---
+apiVersion: mcoperator.sdv.com/v1
+kind: McKube
+metadata:
+  name: high-pod-config
+  namespace: default
+spec:
+  podname: high-pod
+  criticality: "High"
+  rtSettings:
+    period: 100000        # 100ms
+    runtime_low: 25000    # 25ms → 25% CPU
+    runtime_hi: 40000     # 40ms → 40% CPU
+    core: "2"             # Core 2에 할당 → 선점 트리거!

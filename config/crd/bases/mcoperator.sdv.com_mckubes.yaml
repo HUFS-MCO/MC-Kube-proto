@@ -40,10 +40,14 @@ spec:
             description: McKubeSpec defines the desired state of McKube
             properties:
               criticality:
+                description: 'Criticality defines the priority level: Low, Middle,
+                  or High'
+                enum:
+                - Low
+                - Middle
+                - High
                 type: string
               node:
-                description: Foo is an example field of McKube. Edit mckube_types.go
-                  to remove/update
                 type: string
               podname:
                 type: string
@@ -58,15 +62,27 @@ spec:
                     type: string
                   period:
                     type: integer
-                  runtime:
+                  runtime_hi:
+                    type: integer
+                  runtime_low:
                     type: integer
                 required:
                 - period
-                - runtime
+                - runtime_hi
+                - runtime_low
                 type: object
             type: object
           status:
             description: McKubeStatus defines the observed state of McKube
+            properties:
+              currentRuntime:
+                description: CurrentRuntime tracks whether the pod is using runtime_low
+                  or runtime_hi
+                type: string
+              lastOverrunTime:
+                description: LastOverrunTime tracks when the last overrun was detected
+                format: date-time
+                type: string
             type: object
         type: object
     served: true

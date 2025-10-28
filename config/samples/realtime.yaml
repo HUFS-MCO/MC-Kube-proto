@@ -3,7 +3,7 @@ kind: McKubeRealtime
 metadata:
   name: example-realtime-data
 spec:
-  criticality: C
+  criticality: High
   rtPeriod: 100
   rtDeadline: 100
   rtWcets:

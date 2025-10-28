@@ -5,7 +5,7 @@ metadata:
   namespace: default
 spec:
   podname: "invalid-rt-test-pod"
-  criticality: "high"
+  criticality: "High"
   rtSettings:
     period: 1000000     # 1 second
     runtime: 1500000    # 1.5 seconds - INVALID! runtime > period
