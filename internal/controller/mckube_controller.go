@@ -888,6 +888,31 @@ func collectSortedTiers(pods []*corev1.Pod, rtData map[string]RealTimeData) []st
 }
 
 func (r *McKubeReconciler) evictPod(ctx context.Context, pod *corev1.Pod) error {
+	logger := log.Log.WithValues("McKube/rt.evictPod", "Eviction")
+
+	// Step 1: Add label "evicted" to the pod before eviction
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+	pod.Labels["evicted"] = "true"
+
+	logger.V(0).Info("Adding evicted label to pod",
+		"pod", pod.Name,
+		"namespace", pod.Namespace)
+
+	// Update the pod with the new label
+	if err := r.Update(ctx, pod); err != nil {
+		logger.Error(err, "Failed to add evicted label to pod",
+			"pod", pod.Name,
+			"namespace", pod.Namespace)
+		// Continue with eviction even if labeling fails
+	}
+
+	// Step 2: Perform the eviction
+	logger.V(0).Info("Evicting pod",
+		"pod", pod.Name,
+		"namespace", pod.Namespace)
+
 	ev := &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pod.Name,
