@@ -43,7 +43,7 @@ type perTierState struct {
 	DegradeCount    int // Degradation 시도 횟수
 	EvictTried      bool
 	MissingTicks    int
-	LastDegradeTime int // 마지막 Degradation 시도 타임 스탬프
+	LastDegradeTime int       // 마지막 Degradation 시도 타임 스탬프
 	LastSeenTime    time.Time // 마지막으로 CPU 압박이 감지된 시간
 }
 
