@@ -4,22 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	"k8s.io/client-go/dynamic"
@@ -31,25 +26,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	mcoperatorv1 "mc-kube/api/v1"
+	ipvspodmanager "mc-kube/internal/controller/ipvs_pod_manager"
 )
 
 type McKubeReconciler struct {
 	client.Client
 	Scheme        *runtime.Scheme
 	DynamicClient dynamic.Interface
+	DataCollector *ipvspodmanager.DataCollector
+	PodSpecEditor *ipvspodmanager.PodSpecEditor
+	EventHandler  *ipvspodmanager.EventHandler
 }
 
-type RealTimeWCET struct {
-	Node   string
-	RTWcet int
-}
-
-type RealTimeData struct {
-	Criticality string
-	RTDeadline  int
-	RTPeriod    int
-	RTWcets     []RealTimeWCET
-}
+// Type aliases for compatibility
+type RealTimeData = ipvspodmanager.RealTimeData
+type RealTimeWCET = ipvspodmanager.RealTimeWCET
 
 // CgroupRequest for RT daemon communication
 type CgroupRequest struct {
@@ -58,12 +49,6 @@ type CgroupRequest struct {
 	Runtime     int     `json:"runtime"`
 	Core        *string `json:"core,omitempty"`
 }
-
-// Track pod runtime state (low or hi)
-var podRuntimeState = make(map[string]string) // podName -> "low" or "hi"
-var runtimeStateMutex sync.RWMutex
-
-// CgroupRequest는 Webhook에서 사용하므로 컨트롤러에서는 제거
 
 // Timers = (노드 이름 : taint 제거까지 남은 틱 수)
 var Timers = make(map[string]int)
@@ -80,13 +65,6 @@ var criticalityRank = map[string]int{
 }
 
 const targetNamespace = "default"
-
-// Annotations (CPU util sender의 main.go에 명세된 목적지 annotation과 일치해야 함)
-const (
-	annUsageKey   = "mckube.sdv.com/cpu-usage"
-	annDurKey     = "mckube.sdv.com/cpu-over90-duration-s"
-	annCpuBusyKey = "mckube.sdv.com/isCpuBusy"
-)
 
 // Taint key (kept for compatibility, not required for eviction fast-path)
 const rtPressureTaintKey = "McKubeRTDeadlinePressure"
@@ -156,15 +134,6 @@ var cpuPoolsMutex sync.RWMutex
 
 const coreUtilizationThreshold = 0.9 // 90% 임계값
 
-var pressureState = make(map[string]*NodePressureState)
-
-// 중복 처리 방지를 위해 처리 중인 노드 추적
-var processingNodes = make(map[string]bool)
-var processingMutex sync.RWMutex
-
-const minMilli = int64(10)
-const tierMissingTolerance = 2
-
 // ===================== Reconcile =====================
 
 func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -231,14 +200,12 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err := r.Get(ctx, types.NamespacedName{Namespace: rt.Namespace, Name: rt.Spec.PodName}, pod); err == nil {
 			// Pod가 노드에 할당되었고 Pending 또는 Running 상태면 처리
 			if pod.Spec.NodeName != "" && (pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning) {
-				
+
 				if rt.Spec.RTSettings.Core != nil {
 					targetCores := parseCoreSet(*rt.Spec.RTSettings.Core)
-					
+
 					// RT 설정 기반 CPU 사용량 계산
-					runtimeStateMutex.RLock()
-					currentRuntimeState := podRuntimeState[pod.Name]
-					runtimeStateMutex.RUnlock()
+					currentRuntimeState := ipvspodmanager.GetPodRuntimeState(pod.Name)
 
 					var effectiveRuntime int
 					if currentRuntimeState == "hi" {
@@ -288,721 +255,8 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{}, nil
 }
 
-// ===================== 데이터 수집 함수들 (CPU 사용량, 90% 이상 지속 시간, CPU Requests) =====================
-// 이하 모든 함수에서 annotation을 조회할 때는 반드시 etcd에 저장된 annotation 이름과 일치해야 함
-
-// listPodMilliCPUByNode() : 노드에 스케줄된 Pod들의 CPU 요청량(milli CPU 단위) 맵 반환
-// Ex) podMilli := map[string]int64{"test-pod-a": 600}
-func (r *McKubeReconciler) listPodMilliCPUByNode(ctx context.Context, namespace string, node *corev1.Node) (map[string]int64, error) {
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(namespace)); err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64)
-	for i := range podList.Items {
-		p := &podList.Items[i]
-		if p.Spec.NodeName != node.Name {
-			continue
-		}
-		var sumMilli int64
-		for _, c := range p.Spec.Containers {
-			if c.Resources.Requests == nil || c.Resources.Requests.Cpu() == nil {
-				continue
-			}
-			sumMilli += c.Resources.Requests.Cpu().MilliValue()
-		}
-		out[p.Name] = sumMilli
-	}
-	return out, nil
-}
-
-// GetRealTimeData() : 기존 RT KUBE에서의 CRD 기반 RT 데이터 수집 함수 (Criticality, deadline, period, WCET)
-func (r *McKubeReconciler) GetRealTimeData(ctx context.Context) (map[string]RealTimeData, error) {
-	result := make(map[string]RealTimeData)
-
-	items, err := r.GetResourcesDynamically(ctx, "mcoperator.sdv.com", "v1", "mckuberealtimes", "default")
-	if err != nil {
-		log.Log.Error(err, "Failed to get McKubeRealtime resources")
-		return nil, err
-	}
-	for _, item := range items {
-		typedData := RealTimeData{}
-		appName, appNameFound, appNameErr := unstructured.NestedString(item.Object, "metadata", "name")
-		criticality, criticalityFound, criticalityErr := unstructured.NestedString(item.Object, "spec", "criticality")
-		rtDeadline, rtDeadlineFound, rtDeadlineErr := unstructured.NestedInt64(item.Object, "spec", "rtDeadline")
-		rtPeriod, rtPeriodFound, rtPeriodErr := unstructured.NestedInt64(item.Object, "spec", "rtPeriod")
-
-		if !appNameFound || appNameErr != nil {
-			return nil, appNameErr
-		}
-		if !criticalityFound || criticalityErr != nil {
-			return nil, criticalityErr
-		}
-		if !rtDeadlineFound || rtDeadlineErr != nil {
-			return nil, rtDeadlineErr
-		}
-		if !rtPeriodFound || rtPeriodErr != nil {
-			return nil, rtPeriodErr
-		}
-
-		typedData.Criticality = criticality
-		typedData.RTDeadline = int(rtDeadline)
-		typedData.RTPeriod = int(rtPeriod)
-
-		rtWcets, rtWcetsFound, rtWcetsErr := unstructured.NestedSlice(item.Object, "spec", "rtWcets")
-		if !rtWcetsFound || rtWcetsErr != nil {
-			return nil, rtWcetsErr
-		}
-		for _, rtWcet := range rtWcets {
-			m, ok := rtWcet.(map[string]interface{})
-			if !ok {
-				return nil, errors.New("unable to obtain map from rtWcet object")
-			}
-			var wcetInt int
-			switch v := m["rtWcet"].(type) {
-			case int64:
-				wcetInt = int(v)
-			case float64:
-				wcetInt = int(v)
-			default:
-				return nil, errors.New("rtWcet: unsupported number type")
-			}
-			typedData.RTWcets = append(typedData.RTWcets, RealTimeWCET{
-				Node:   fmt.Sprintf("%v", m["node"]),
-				RTWcet: wcetInt,
-			})
-		}
-		result[appName] = typedData
-	}
-	return result, nil
-}
-
-// GetResourcesDynamically() : {Group, Version, Resource} 기반 K8s 리소스 조회 함수
-func (r *McKubeReconciler) GetResourcesDynamically(ctx context.Context, group, version, resource, namespace string) ([]unstructured.Unstructured, error) {
-	log.Log.V(1).Info("Inside GetResourcesDynamically", "group", group, "version", version, "resource", resource, "namespace", namespace)
-	gvr := schema.GroupVersionResource{Group: group, Version: version, Resource: resource}
-	list, err := r.DynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Log.Error(err, "GetResourcesDynamically: failed to list", "gvr", gvr)
-		return nil, err
-	}
-	return list.Items, nil
-}
-
-// ===================== Pod spec 조정 관련 함수들 =====================
-
-// degradePodRequests() : Pod의 CPU 요청량을 임의의 비율 만큼 감소시킴
-func (r *McKubeReconciler) degradePodRequests(ctx context.Context, pod *corev1.Pod, ratio float64) error {
-	type containerPatch struct {
-		Name      string `json:"name"`
-		Resources struct {
-			Requests map[string]string `json:"requests,omitempty"`
-			Limits   map[string]string `json:"limits,omitempty"`
-		} `json:"resources"`
-	}
-	type patchSpec struct {
-		Containers []containerPatch `json:"containers"`
-	}
-	type patchRoot struct {
-		Spec patchSpec `json:"spec"`
-	}
-
-	var pr patchRoot
-	for _, c := range pod.Spec.Containers {
-		// Only patch containers that have CPU requests
-		if c.Resources.Requests == nil {
-			continue
-		}
-		reqCPU := c.Resources.Requests.Cpu()
-		if reqCPU == nil || reqCPU.IsZero() {
-			continue
-		}
-
-		oldMilli := reqCPU.MilliValue()
-		newMilli := int64(float64(oldMilli) * (1.0 - ratio))
-		if newMilli < minMilli {
-			newMilli = minMilli
-		}
-
-		entry := containerPatch{Name: c.Name}
-
-		entry.Resources.Requests = map[string]string{
-			string(corev1.ResourceCPU): fmt.Sprintf("%dm", newMilli),
-		}
-
-		if len(c.Resources.Limits) > 0 {
-			entry.Resources.Limits = make(map[string]string)
-			for resName, qty := range c.Resources.Limits {
-				entry.Resources.Limits[string(resName)] = qty.String()
-			}
-		}
-		pr.Spec.Containers = append(pr.Spec.Containers, entry)
-	}
-
-	if len(pr.Spec.Containers) == 0 {
-		return nil
-	}
-
-	patchBytes, err := json.Marshal(pr)
-	if err != nil {
-		return err
-	}
-
-	if err := r.SubResource("resize").Patch(ctx, pod, client.RawPatch(types.MergePatchType, patchBytes)); err != nil {
-		return err
-	}
-	return nil
-}
-
-// pickHighestCPUFromMilli() : 가장 높은 CPU 요청량을 가진 Pod 선택 함수
-func pickHighestCPUFromMilli(pods []*corev1.Pod, podMilli map[string]int64) *corev1.Pod {
-	var best *corev1.Pod
-	var bestMilli int64 = -1
-	for _, p := range pods {
-		if m, ok := podMilli[p.Name]; ok {
-			if m > bestMilli {
-				bestMilli = m
-				best = p
-			}
-		}
-	}
-	return best
-}
-
-// filterPodsByCriticality() : 특정 Criticality 값을 가진 Pod들을 필터링하는 함수
-// → 추후 동일 Criticality를 가진 Pod들을 하나의 그룹으로 묶어 processCurrentTier()에서 처리할 때 사용됨
-func filterPodsByCriticality(pods []*corev1.Pod, rtData map[string]RealTimeData, crit string) []*corev1.Pod {
-	var out []*corev1.Pod
-	for _, p := range pods {
-		app := p.Labels["sdv.com"]
-		if app == "" {
-			continue
-		}
-		if rt, ok := rtData[app]; ok {
-			if rt.Criticality == crit {
-				out = append(out, p)
-			}
-		}
-	}
-	return out
-}
-
-// hasActionableInTier() : 특정 Criticality 티어에 대해 조치 가능한 Pod가 있는지 확인
-func hasActionableInTier(pods []*corev1.Pod, rtData map[string]RealTimeData, tier string) bool {
-	targets := filterPodsByCriticality(pods, rtData, tier)
-	if len(targets) == 0 {
-		return false
-	}
-	for _, p := range targets {
-		for _, c := range p.Spec.Containers {
-			if c.Resources.Requests == nil || c.Resources.Requests.Cpu() == nil {
-				continue
-			}
-			if c.Resources.Requests.Cpu().MilliValue() > minMilli {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// ===================== 이벤트 기반 처리 함수들 =====================
-
-// handleNodeCPUPressure() :  노드의 CPU 사용률이 90% 이상일 때, annotation 및 CR 정보를 파싱하여 processCurrentTier()에 전달하는 함수
-func (r *McKubeReconciler) handleNodeCPUPressure(ctx context.Context, nodeName string) {
-	logger := log.Log.WithValues("McKube/rt.CPUPressureHandler", "EventDriven", "node", nodeName)
-
-	node := &corev1.Node{}
-	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
-		logger.Error(err, "Failed to get node")
-		return
-	}
-
-	ann := node.GetAnnotations()
-	if ann == nil {
-		logger.V(1).Info("Node has no annotations")
-		return
-	}
-
-	cpuUsageStr := strings.TrimSpace(ann[annUsageKey])
-	if cpuUsageStr == "" {
-		logger.Error(fmt.Errorf("missing annotation %q", annUsageKey), "Failed to get CPU usage from node")
-		return
-	}
-
-	cpuUsage, err := strconv.ParseFloat(cpuUsageStr, 64)
-	if err != nil {
-		logger.Error(err, "Failed to parse CPU usage from node annotation", "value", cpuUsageStr)
-		return
-	}
-
-	overSecStr := strings.TrimSpace(ann[annDurKey])
-	overSec := 0
-	if overSecStr != "" {
-		if sec, err := strconv.ParseInt(overSecStr, 10, 64); err == nil {
-			if sec >= 0 {
-				overSec = int(sec)
-			}
-		} else {
-			logger.V(1).Info("Failed to parse over90 duration; treating as 0", "err", err.Error(), "value", overSecStr)
-		}
-	}
-
-	rtData, err := r.GetRealTimeData(ctx)
-	if err != nil {
-		logger.Error(err, "Failed to get RT data")
-		return
-	}
-
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(targetNamespace)); err != nil {
-		logger.Error(err, "Failed to list pods", "namespace", targetNamespace)
-		return
-	}
-
-	var nodePods []*corev1.Pod
-	for i := range podList.Items {
-		p := &podList.Items[i]
-		if p.Spec.NodeName == nodeName {
-			nodePods = append(nodePods, p)
-		}
-	}
-
-	if len(nodePods) == 0 {
-		logger.V(1).Info("No pods found on node")
-		return
-	}
-
-	podMilli, err := r.listPodMilliCPUByNode(ctx, targetNamespace, node)
-	if err != nil {
-		logger.Error(err, "Failed to list pod milliCPU (requests-based)")
-		return
-	}
-
-	state := pressureState[nodeName]
-	if state == nil {
-		state = &NodePressureState{
-			AboveSec:       0,
-			Tiers:          nil,
-			CurrentTierIdx: 0,
-			CurrentTier:    "",
-			PerTier:        map[string]*perTierState{},
-		}
-		pressureState[nodeName] = state
-	}
-	state.Tiers = collectSortedTiers(nodePods, rtData)
-	state.AboveSec = overSec
-
-	reindexCurrentTier(state)
-
-	// Tier가 없으면 스킵
-	if len(state.Tiers) == 0 {
-		logger.V(0).Info("No criticality tiers detected on node; skipping",
-			"cpu(%)", fmt.Sprintf("%.1f", cpuUsage), "over90Sec", overSec)
-		return
-	}
-
-	// Current tier 설정 (여전히 비어있다면 안전 초기화)
-	if state.CurrentTier == "" || state.CurrentTierIdx >= len(state.Tiers) {
-		state.CurrentTierIdx = 0
-		state.CurrentTier = state.Tiers[0]
-		if _, ok := state.PerTier[state.CurrentTier]; !ok {
-			state.PerTier[state.CurrentTier] = &perTierState{}
-		}
-		logger.V(0).Info("Pinning current tier to lowest detected tier",
-			"tier", state.CurrentTier)
-	}
-
-	// 현 Criticality에 대해 조치 가능한 Pod에 대한 처리 진행
-	r.processCurrentTier(ctx, logger, state, nodePods, rtData, podMilli, overSec, cpuUsage)
-}
-
-// handleCPURecovery() : CPU가 정상화되었을 때 (isCpuBusy=false) 모든 RT Pod를 runtime_low로 복귀시키는 함수
-func (r *McKubeReconciler) handleCPURecovery(ctx context.Context, nodeName string) {
-	logger := log.Log.WithValues("McKube/rt.CPURecovery", "Recovery", "node", nodeName)
-	logger.V(0).Info("CPU recovered (isCpuBusy=false), reverting pods to runtime_low")
-
-	// 노드의 pressure state 리셋
-	if _, exists := pressureState[nodeName]; exists {
-		logger.V(0).Info("Resetting node pressure state")
-		delete(pressureState, nodeName)
-	}
-
-	// 해당 노드의 모든 Pod 조회
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(targetNamespace)); err != nil {
-		logger.Error(err, "Failed to list pods", "namespace", targetNamespace)
-		return
-	}
-
-	var nodePods []*corev1.Pod
-	for i := range podList.Items {
-		p := &podList.Items[i]
-		if p.Spec.NodeName == nodeName {
-			// sdv.com 라벨이 있는 RT Pod만 처리
-			if p.Labels != nil && p.Labels["sdv.com"] != "" {
-				nodePods = append(nodePods, p)
-			}
-		}
-	}
-
-	if len(nodePods) == 0 {
-		logger.V(1).Info("No RT pods found on node")
-		return
-	}
-
-	logger.V(0).Info("Found RT pods to revert", "count", len(nodePods))
-
-	// 각 Pod에 대해 runtime_low로 복귀 처리
-	for _, pod := range nodePods {
-		// 현재 runtime 상태 확인
-		runtimeStateMutex.RLock()
-		currentState := podRuntimeState[pod.Name]
-		runtimeStateMutex.RUnlock()
-
-		if currentState != "hi" {
-			// 이미 low 상태이거나 설정되지 않음
-			logger.V(1).Info("Pod not in hi state, skipping", "pod", pod.Name)
-			continue
-		}
-
-		// McKube CR 조회
-		mckubeList := &mcoperatorv1.McKubeList{}
-		if err := r.List(ctx, mckubeList, client.InNamespace(pod.Namespace)); err != nil {
-			logger.Error(err, "Failed to list McKube resources", "pod", pod.Name)
-			continue
-		}
-
-		var targetMcKube *mcoperatorv1.McKube
-		for i := range mckubeList.Items {
-			if mckubeList.Items[i].Spec.PodName == pod.Name {
-				targetMcKube = &mckubeList.Items[i]
-				break
-			}
-		}
-
-		if targetMcKube == nil || targetMcKube.Spec.RTSettings == nil {
-			logger.V(1).Info("No McKube CR or RT settings found for pod", "pod", pod.Name)
-			continue
-		}
-
-		// runtime_hi → runtime_low로 복귀
-		logger.V(0).Info("Reverting pod runtime from hi to low",
-			"pod", pod.Name,
-			"runtime_hi", targetMcKube.Spec.RTSettings.RuntimeHi,
-			"runtime_low", targetMcKube.Spec.RTSettings.RuntimeLow)
-
-		// 모든 컨테이너에 runtime_low 적용
-		nodeIP := pod.Status.HostIP
-		if nodeIP == "" {
-			logger.Error(fmt.Errorf("node IP not available"), "Failed to get node IP", "pod", pod.Name)
-			continue
-		}
-
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.ContainerID == "" {
-				continue
-			}
-
-			req := CgroupRequest{
-				ContainerID: cs.ContainerID,
-				Period:      targetMcKube.Spec.RTSettings.Period,
-				Runtime:     targetMcKube.Spec.RTSettings.RuntimeLow,
-				Core:        targetMcKube.Spec.RTSettings.Core,
-			}
-
-			if err := r.sendRTRequest(nodeIP, req); err != nil {
-				logger.Error(err, "Failed to apply runtime_low to container",
-					"containerID", cs.ContainerID,
-					"pod", pod.Name)
-				continue
-			}
-
-			logger.V(0).Info("Successfully reverted container to runtime_low",
-				"pod", pod.Name,
-				"container", cs.Name,
-				"runtime", targetMcKube.Spec.RTSettings.RuntimeLow)
-		}
-
-		// 상태 업데이트
-		runtimeStateMutex.Lock()
-		podRuntimeState[pod.Name] = "low"
-		runtimeStateMutex.Unlock()
-
-		// McKube CR 상태 업데이트
-		targetMcKube.Status.CurrentRuntime = "low"
-		if err := r.Status().Update(ctx, targetMcKube); err != nil {
-			logger.Error(err, "Failed to update McKube status", "pod", pod.Name)
-		}
-	}
-
-	logger.V(0).Info("CPU recovery completed", "podsReverted", len(nodePods))
-}
-
-// processCurrentTier() : 현재 Criticality 티어에 대해 다음의 로직을 수행
-//
-//  1. 90% 이상 지속 시간이 1초 이상인 경우
-//     - 현재 배포된 Pod 중 가장 낮은 Criticality를 가진 Pod의 CPU 요청량에 20% 감소 적용 (Graceful degradation)
-//
-//  2. 90% 이상 지속 시간이 10초 이상인 경우
-//     - 이전 기준에서 Degradation을 적용했던 Pod에 대해 Eviction 처리
-func (r *McKubeReconciler) processCurrentTier(ctx context.Context, logger logr.Logger, state *NodePressureState, nodePods []*corev1.Pod, rtData map[string]RealTimeData, podMilli map[string]int64, overSec int, cpuUsage float64) {
-	curTier := state.CurrentTier
-	pts := state.PerTier[curTier]
-	if pts == nil {
-		pts = &perTierState{}
-		state.PerTier[curTier] = pts
-	}
-
-	targets := filterPodsByCriticality(nodePods, rtData, curTier)
-	targetsCount := len(targets)
-
-	logger.V(0).Info("Node pressure snapshot",
-		"cpu(%)", fmt.Sprintf("%.1f", cpuUsage),
-		"over90Sec", overSec,
-		"currentTier", curTier,
-		"targetsCount", targetsCount,
-		"degradeCount", pts.DegradeCount,
-		"evictTried", pts.EvictTried,
-	)
-
-	// 동일 티어에서 처리될 Pod가 없다면, 다음 티어로 격상
-	if targetsCount == 0 {
-		pts.MissingTicks++
-		logger.V(0).Info("No targets in current tier; incrementing MissingTicks",
-			"tier", curTier, "missingTicks", pts.MissingTicks)
-
-		if pts.MissingTicks >= tierMissingTolerance {
-			if nextTier, ok := nextHigherTier(curTier, state.Tiers); ok {
-				logger.V(0).Info("Escalating to next criticality tier",
-					"fromTier", curTier, "toTier", nextTier)
-				state.CurrentTier = nextTier
-
-				for i, t := range state.Tiers {
-					if t == nextTier {
-						state.CurrentTierIdx = i
-						break
-					}
-				}
-				if _, ok := state.PerTier[nextTier]; !ok {
-					state.PerTier[nextTier] = &perTierState{}
-				}
-				// 재귀적으로 다음 티어 처리
-				r.processCurrentTier(ctx, logger, state, nodePods, rtData, podMilli, overSec, cpuUsage)
-			}
-		}
-		return
-	}
-
-	pts.MissingTicks = 0
-
-	// CPU 임계점 지속 시간이 1초 이상이라면, Graceful degradation 반복 수행
-	if overSec >= 1 && !pts.EvictTried {
-		// 3초마다 또는 처음 시도할 때 degradation 수행
-		shouldDegrade := pts.DegradeCount == 0 || (overSec-pts.LastDegradeTime >= 3)
-
-		if shouldDegrade {
-			top := pickHighestCPUFromMilli(targets, podMilli)
-			if top != nil {
-				// 현재 CPU 요청량 확인
-				currentMilli := int64(0)
-				if podMilli[top.Name] > 0 {
-					currentMilli = podMilli[top.Name]
-				}
-
-				// minMilli 이하로는 degradation하지 않음
-				if currentMilli > minMilli {
-					degradeRatio := 0.2 // 20% (Graceful degradation 비율)
-					logger.V(0).Info("Stage 1: Attempting graceful degradation on heaviest pod",
-						"tier", curTier,
-						"pod", top.Name,
-						"over90Sec", overSec,
-						"degradeAttempt", pts.DegradeCount+1,
-						"currentMilliCPU", currentMilli,
-						"degradeRatio", fmt.Sprintf("%.1f%%", degradeRatio*100))
-
-					if err := r.degradePodRequests(ctx, top, degradeRatio); err != nil {
-						logger.Error(err, "Graceful degradation failed",
-							"tier", curTier, "pod", top.Name, "attempt", pts.DegradeCount+1)
-					} else {
-						pts.DegradeCount++
-						pts.LastDegradeTime = overSec
-						logger.V(0).Info("Stage 1: Graceful degradation applied successfully",
-							"tier", curTier,
-							"pod", top.Name,
-							"totalDegradations", pts.DegradeCount)
-					}
-				} else {
-					logger.V(0).Info("Pod already at minimum CPU requests; no further degradation possible",
-						"tier", curTier, "pod", top.Name, "currentMilliCPU", currentMilli, "minMilli", minMilli)
-					pts.DegradeCount = 999 // 더 이상 degradation 불가
-				}
-			}
-		}
-	}
-
-	// 90% 지속 시간이 10초 이상이라면, eviction
-	if overSec >= 10 && pts.DegradeCount > 0 && !pts.EvictTried {
-		victim := pickHighestCPUFromMilli(targets, podMilli)
-		if victim != nil {
-			logger.V(0).Info("Stage 2: Immediate eviction due to sustained high CPU",
-				"tier", curTier, "pod", victim.Name, "over90Sec", overSec)
-			if err := r.evictPod(ctx, victim); err != nil {
-				logger.Error(err, "Eviction failed",
-					"tier", curTier, "pod", victim.Name)
-				pts.EvictTried = true
-			} else {
-				logger.V(0).Info("Stage 2: Eviction succeeded",
-					"tier", curTier, "pod", victim.Name)
-				pts.EvictTried = true
-			}
-		}
-	}
-
-	// 처리 완료 후 더 이상 actionable한 Pod가 없으면 다음 tier로 에스컬레이션
-	if pts.DegradeCount > 0 && pts.EvictTried {
-		actionable := hasActionableInTier(nodePods, rtData, curTier)
-		if !actionable {
-			if nextTier, ok := nextHigherTier(curTier, state.Tiers); ok {
-				logger.V(0).Info("Stage 3: Escalating to next criticality tier",
-					"fromTier", curTier, "toTier", nextTier)
-				state.CurrentTier = nextTier
-
-				for i, t := range state.Tiers {
-					if t == nextTier {
-						state.CurrentTierIdx = i
-						break
-					}
-				}
-				if _, ok := state.PerTier[nextTier]; !ok {
-					state.PerTier[nextTier] = &perTierState{}
-				}
-			}
-		}
-	}
-}
-
-// findObjectsForNode() : 노드의 annotation 변경을 감지하는 이벤트 핸들러 함수
-func (r *McKubeReconciler) findObjectsForNode(ctx context.Context, node client.Object) []reconcile.Request {
-	nodeObj := node.(*corev1.Node)
-
-	ann := nodeObj.GetAnnotations()
-	if ann == nil {
-		return []reconcile.Request{}
-	}
-
-	cpuUsageStr := strings.TrimSpace(ann[annUsageKey])
-	if cpuUsageStr == "" {
-		return []reconcile.Request{}
-	}
-	cpuUsage, err := strconv.ParseFloat(cpuUsageStr, 64)
-	if err != nil {
-		return []reconcile.Request{}
-	}
-
-	// isCpuBusy 상태 확인
-	isCpuBusyStr := strings.TrimSpace(ann[annCpuBusyKey])
-	isCpuBusy := true // 기본값 true
-	if isCpuBusyStr != "" {
-		if busy, err := strconv.ParseBool(isCpuBusyStr); err == nil {
-			isCpuBusy = busy
-		}
-	}
-
-	// 이미 진행중인 노드라면 스킵
-	processingMutex.Lock()
-	if processingNodes[nodeObj.Name] {
-		processingMutex.Unlock()
-		return []reconcile.Request{}
-	}
-	processingNodes[nodeObj.Name] = true
-	processingMutex.Unlock()
-
-	logger := log.Log.WithValues("McKube/rt.NodeEvent", "CPU-Event")
-	logger.V(0).Info("CPU annotation change detected",
-		"node", nodeObj.Name,
-		"cpu(%)", fmt.Sprintf("%.1f", cpuUsage),
-		"isCpuBusy", isCpuBusy)
-
-	// CPU pressure 처리를 별도 Go Routine에서 비동기로 진행
-	go func() {
-		defer func() {
-			// 처리 플래그 초기화
-			processingMutex.Lock()
-			delete(processingNodes, nodeObj.Name)
-			processingMutex.Unlock()
-		}()
-
-		// 백그라운드 처리를 위한 30초 타임아웃
-		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		// isCpuBusy=false인 경우: 모든 Pod를 runtime_low로 복귀
-		if !isCpuBusy {
-			r.handleCPURecovery(bgCtx, nodeObj.Name)
-		} else {
-			// isCpuBusy=true인 경우: 기존 CPU pressure 처리
-			r.handleNodeCPUPressure(bgCtx, nodeObj.Name)
-		}
-	}()
-
-	return []reconcile.Request{}
-}
-
-func collectSortedTiers(pods []*corev1.Pod, rtData map[string]RealTimeData) []string {
-	seen := map[string]bool{}
-	for _, p := range pods {
-		app := p.Labels["sdv.com"]
-		if app == "" {
-			continue
-		}
-		if rt, ok := rtData[app]; ok {
-			if _, ok2 := criticalityRank[rt.Criticality]; ok2 {
-				seen[rt.Criticality] = true
-			}
-		}
-	}
-	var tiers []string
-	for c := range seen {
-		tiers = append(tiers, c)
-	}
-	// ascending by rank
-	for i := 0; i < len(tiers); i++ {
-		for j := i + 1; j < len(tiers); j++ {
-			if criticalityRank[tiers[j]] < criticalityRank[tiers[i]] {
-				tiers[i], tiers[j] = tiers[j], tiers[i]
-			}
-		}
-	}
-	return tiers
-}
-
-func (r *McKubeReconciler) evictPod(ctx context.Context, pod *corev1.Pod) error {
-	logger := log.Log.WithValues("McKube/rt.evictPod", "Eviction")
-
-	// Step 1: Add label "evicted" to the pod before eviction
-	if pod.Labels == nil {
-		pod.Labels = make(map[string]string)
-	}
-	pod.Labels["evicted"] = "true"
-
-	logger.V(0).Info("Adding evicted label to pod",
-		"pod", pod.Name,
-		"namespace", pod.Namespace)
-
-	// Update the pod with the new label
-	if err := r.Update(ctx, pod); err != nil {
-		logger.Error(err, "Failed to add evicted label to pod",
-			"pod", pod.Name,
-			"namespace", pod.Namespace)
-		// Continue with eviction even if labeling fails
-	}
-
-	// Step 2: Perform the eviction
-	logger.V(0).Info("Evicting pod",
-		"pod", pod.Name,
-		"namespace", pod.Namespace)
-
+// evictPodSimple performs simple pod eviction
+func (r *McKubeReconciler) evictPodSimple(ctx context.Context, pod *corev1.Pod) error {
 	ev := &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pod.Name,
@@ -1012,45 +266,9 @@ func (r *McKubeReconciler) evictPod(ctx context.Context, pod *corev1.Pod) error 
 	return r.SubResource("eviction").Create(ctx, pod, ev)
 }
 
-// ===================== Tier helpers =====================
-
-// 현재 state.Tiers가 동적으로 바뀐 뒤, CurrentTier/Idx를 재정렬된 목록에 맞춰 재동기화
-func reindexCurrentTier(state *NodePressureState) {
-	if len(state.Tiers) == 0 {
-		state.CurrentTier = ""
-		state.CurrentTierIdx = 0
-		return
-	}
-	// 현재 티어가 목록에 있으면 그 위치로 동기화
-	for i, t := range state.Tiers {
-		if t == state.CurrentTier {
-			state.CurrentTierIdx = i
-			return
-		}
-	}
-	// 없으면 최하위(랭크가 가장 낮은) 티어로 리셋
-	state.CurrentTierIdx = 0
-	state.CurrentTier = state.Tiers[0]
-}
-
-// 현재 티어보다 높은(랭크가 큰) 티어 중 가장 낮은 랭크를 반환
-func nextHigherTier(cur string, tiers []string) (string, bool) {
-	curRank, ok := criticalityRank[cur]
-	if !ok {
-		return "", false
-	}
-	bestRank := 1 << 30
-	best := ""
-	for _, t := range tiers {
-		if r, ok := criticalityRank[t]; ok && r > curRank && r < bestRank {
-			bestRank = r
-			best = t
-		}
-	}
-	if best == "" {
-		return "", false
-	}
-	return best, true
+// findObjectsForNode handles node events by delegating to EventHandler
+func (r *McKubeReconciler) findObjectsForNode(ctx context.Context, node client.Object) []reconcile.Request {
+	return r.EventHandler.FindObjectsForNode(ctx, node)
 }
 
 // ===================== Utils / timing =====================
@@ -1297,7 +515,7 @@ func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
 
 	// Criticality 정보 로깅
 	if app, ok := pod.Labels["sdv.com"]; ok {
-		rtData, err := r.GetRealTimeData(ctx)
+		rtData, err := r.DataCollector.GetRealTimeData(ctx)
 		if err == nil {
 			if rt, found := rtData[app]; found {
 				logger.V(0).Info("Pod RT Information",
@@ -1310,9 +528,7 @@ func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
 	}
 
 	// 현재 runtime 상태 확인
-	runtimeStateMutex.RLock()
-	currentState := podRuntimeState[pod.Name]
-	runtimeStateMutex.RUnlock()
+	currentState := ipvspodmanager.GetPodRuntimeState(pod.Name)
 
 	if currentState == "hi" {
 		logger.V(0).Info("Pod already using runtime_hi, no action needed",
@@ -1348,9 +564,7 @@ func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
 	}
 
 	// 상태 업데이트
-	runtimeStateMutex.Lock()
-	podRuntimeState[pod.Name] = "hi"
-	runtimeStateMutex.Unlock()
+	ipvspodmanager.SetPodRuntimeState(pod.Name, "hi")
 
 	// McKube CR 상태 업데이트
 	now := metav1.Now()
@@ -1419,6 +633,11 @@ func (r *McKubeReconciler) findPodByContainerID(ctx context.Context, nodeName st
 	}
 
 	return nil, nil
+}
+
+// SendRTRequest sends RT configuration request to daemon (exported version)
+func (r *McKubeReconciler) SendRTRequest(nodeIP string, req CgroupRequest) error {
+	return r.sendRTRequest(nodeIP, req)
 }
 
 // sendRTRequest sends RT configuration request to daemon
@@ -1695,7 +914,7 @@ func (r *McKubeReconciler) preemptPod(ctx context.Context, victim PodInfo, pool 
 		"pod", victim.Name,
 		"criticality", victim.Criticality)
 
-	return r.evictPod(ctx, pod)
+	return r.evictPodSimple(ctx, pod)
 }
 
 // updatePodCoreAffinity: Pod의 CPU 코어 어피니티 업데이트
@@ -1799,26 +1018,6 @@ func parseCoreSet(coreStr string) []int {
 	return cores
 }
 
-// getPodCPUMillis: Pod의 CPU 요청량을 밀리코어로 반환
-func (r *McKubeReconciler) getPodCPUMillis(pod *corev1.Pod) int64 {
-	totalMillis := int64(0)
-
-	for _, container := range pod.Spec.Containers {
-		if container.Resources.Requests != nil {
-			if cpu := container.Resources.Requests.Cpu(); cpu != nil {
-				totalMillis += cpu.MilliValue()
-			}
-		}
-	}
-
-	// 최소값 보장
-	if totalMillis == 0 {
-		totalMillis = 100 // 기본값 100m
-	}
-
-	return totalMillis
-}
-
 // updateCPUPoolForPod: Pod 정보를 CPU Pool에 업데이트
 func (r *McKubeReconciler) updateCPUPoolForPod(ctx context.Context, pod *corev1.Pod, mckube *mcoperatorv1.McKube) error {
 	if mckube.Spec.RTSettings == nil || mckube.Spec.RTSettings.Core == nil {
@@ -1837,9 +1036,7 @@ func (r *McKubeReconciler) updateCPUPoolForPod(ctx context.Context, pod *corev1.
 	// Runtime과 Period를 사용하여 실제 CPU 사용률 추정
 	// CPU 사용량 (millis) = (runtime / period) * 1000
 	// 현재 runtime 상태 확인
-	runtimeStateMutex.RLock()
-	currentRuntimeState := podRuntimeState[pod.Name]
-	runtimeStateMutex.RUnlock()
+	currentRuntimeState := ipvspodmanager.GetPodRuntimeState(pod.Name)
 
 	var effectiveRuntime int
 	if currentRuntimeState == "hi" {
@@ -1901,9 +1098,7 @@ func (r *McKubeReconciler) applyRTSettingsToContainers(ctx context.Context, pod 
 	}
 
 	// 현재 runtime 상태 확인
-	runtimeStateMutex.RLock()
-	currentRuntimeState := podRuntimeState[pod.Name]
-	runtimeStateMutex.RUnlock()
+	currentRuntimeState := ipvspodmanager.GetPodRuntimeState(pod.Name)
 
 	var effectiveRuntime int
 	if currentRuntimeState == "hi" {

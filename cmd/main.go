@@ -39,6 +39,7 @@ import (
 
 	mcoperatorv1 "mc-kube/api/v1"
 	"mc-kube/internal/controller"
+	ipvspodmanager "mc-kube/internal/controller/ipvs_pod_manager"
 	mcwebhook "mc-kube/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
@@ -152,6 +153,29 @@ func main() {
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		DynamicClient: dynamic.NewForConfigOrDie(mgr.GetConfig()),
+	}
+
+	// Initialize DataCollector
+	reconciler.DataCollector = ipvspodmanager.NewDataCollector(mgr.GetClient(), dynamic.NewForConfigOrDie(mgr.GetConfig()))
+
+	// Initialize PodSpecEditor
+	reconciler.PodSpecEditor = ipvspodmanager.NewPodSpecEditor(mgr.GetClient(), 10) // minMilli = 10
+
+	// Initialize EventHandler
+	reconciler.EventHandler = &ipvspodmanager.EventHandler{
+		Client:        mgr.GetClient(),
+		DataCollector: reconciler.DataCollector,
+		PodSpecEditor: reconciler.PodSpecEditor,
+		SendRTRequest: func(nodeIP string, req ipvspodmanager.CgroupRequest) error {
+			// Convert to controller.CgroupRequest for sendRTRequest
+			controllerReq := controller.CgroupRequest{
+				ContainerID: req.ContainerID,
+				Period:      req.Period,
+				Runtime:     req.Runtime,
+				Core:        req.Core,
+			}
+			return reconciler.SendRTRequest(nodeIP, controllerReq)
+		},
 	}
 
 	if err = reconciler.SetupWithManager(mgr); err != nil {
