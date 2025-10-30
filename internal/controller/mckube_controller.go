@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"golang.org/x/sys/unix"
 
 	"k8s.io/client-go/dynamic"
 
@@ -109,9 +110,11 @@ type perTierState struct {
 
 // ===================== Overrun 이벤트 로깅 용 데이터 =====================
 type OverrunData struct {
-	NodeName    string `json:"node_name,omitempty"` // optional
-	ContainerID string `json:"container_id"`        // required
-	Timestamp   int64  `json:"timestamp,omitempty"` // optional
+	NodeName    string `json:"node_name,omitempty"`    // optional
+	ContainerID string `json:"container_id"`           // required
+	Timestamp   uint64 `json:"timestamp,omitempty"`    // eBPF monotonic timestamp (ns)
+	RecvTime    int64  `json:"recv_time,omitempty"`    // Controller receive time (monotonic ns)
+	Latency     int64  `json:"latency_ns,omitempty"`   // Calculated latency (recv - ts)
 }
 
 // ===================== CPU Pool 관리를 위한 데이터 구조 =====================
@@ -702,6 +705,13 @@ func (r *McKubeReconciler) StartOverrunListener(port int) {
 		logger.V(0).Info("Starting overrun listener", "port", port)
 
 		http.HandleFunc("/overrun", func(w http.ResponseWriter, req *http.Request) {
+			// Monotonic timestamp 즉시 기록
+			var ts unix.Timespec
+			if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+				logger.Error(err, "Failed to get monotonic time")
+			}
+			recvTimeNs := ts.Sec*1e9 + ts.Nsec
+
 			if req.Method != http.MethodPost {
 				logger.V(1).Info("Invalid method for /overrun", "method", req.Method)
 				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -716,10 +726,8 @@ func (r *McKubeReconciler) StartOverrunListener(port int) {
 				return
 			}
 
-			logger.V(0).Info("Received overrun event",
-				"node", data.NodeName,
-				"containerID", data.ContainerID,
-				"timestamp", data.Timestamp)
+			// 수신 시간만 기록 (latency는 handleOverrunEvent에서 계산)
+			data.RecvTime = recvTimeNs
 
 			r.handleOverrunEvent(data)
 
@@ -770,6 +778,20 @@ func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
 			break
 		}
 	}
+
+	// Latency 계산 및 측정 로깅 (V(99)로 필터링 가능)
+	if data.Timestamp > 0 && data.RecvTime > 0 {
+		data.Latency = data.RecvTime - int64(data.Timestamp)
+	}
+	
+	logger.V(99).Info("LATENCY_MEASUREMENT",
+		"podName", pod.Name,
+		"namespace", pod.Namespace,
+		"containerName", containerName,
+		"containerID", data.ContainerID,
+		"sendTimeNs", data.Timestamp,
+		"recvTimeNs", data.RecvTime,
+		"latencyNs", data.Latency)
 
 	// 파드 정보 로깅
 	logger.V(0).Info("=== Overrun Pod Identified ===",
