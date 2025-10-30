@@ -28,8 +28,8 @@ type McKubeSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	Node                     string `json:"node,omitempty"`
-	PodName                  string `json:"podname,omitempty"`
+	Node    string `json:"node,omitempty"`
+	PodName string `json:"podname,omitempty"`
 	// Criticality defines the priority level: Low, Middle, or High
 	// +kubebuilder:validation:Enum=Low;Middle;High
 	Criticality              string `json:"criticality,omitempty"`
