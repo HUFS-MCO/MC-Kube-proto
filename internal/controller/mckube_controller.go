@@ -784,7 +784,7 @@ func (r *McKubeReconciler) handleOverrunEvent(data OverrunData) {
 		data.Latency = data.RecvTime - int64(data.Timestamp)
 	}
 	
-	logger.V(99).Info("LATENCY_MEASUREMENT",
+	logger.Error(nil, "LATENCY_MEASUREMENT",
 		"podName", pod.Name,
 		"namespace", pod.Namespace,
 		"containerName", containerName,

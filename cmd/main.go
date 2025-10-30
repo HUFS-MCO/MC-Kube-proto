@@ -73,13 +73,11 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
-		Development: false,
+		Development: true,
+		Level:       zapcore.Level(0),
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
-	
-	// V(99)만 출력하도록 설정 (info level은 차단, V(99)는 -99 레벨이므로 활성화)
-	opts.Level = zapcore.Level(-99)
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 

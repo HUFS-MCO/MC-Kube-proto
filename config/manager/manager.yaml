@@ -63,6 +63,7 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --zap-log-level=error
         image: controller:latest
         name: manager
         securityContext:
