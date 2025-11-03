@@ -130,7 +130,6 @@ func (dc *DataCollector) GetRealTimeData(ctx context.Context) (map[string]RealTi
 
 // GetResourcesDynamically queries K8s resources based on {Group, Version, Resource}
 func (dc *DataCollector) GetResourcesDynamically(ctx context.Context, group, version, resource, namespace string) ([]unstructured.Unstructured, error) {
-	log.Log.V(1).Info("Inside GetResourcesDynamically", "group", group, "version", version, "resource", resource, "namespace", namespace)
 	gvr := schema.GroupVersionResource{Group: group, Version: version, Resource: resource}
 	list, err := dc.DynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {

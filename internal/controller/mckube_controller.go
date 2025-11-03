@@ -151,7 +151,6 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	defer duration(track("Reconcile"))
 	logger := log.Log.WithValues("McKube/rt", req.NamespacedName)
-
 	// logger.V() 안에 작성되는 숫자가 낮을수록 높은 우선 순위
 	// V : Verbosity level (상세도)
 	loggerLowPrio := logger.V(1)
@@ -197,7 +196,6 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 
 		rt.Spec.Node = pod.Spec.NodeName
-		loggerHighPrio.Info("Updating McKube resource with Node name", "nodeName", rt.Spec.Node)
 		if err := r.Update(ctx, rt); err != nil {
 			logger.Error(err, "Failed to update McKube resource with node name")
 			return ctrl.Result{}, err

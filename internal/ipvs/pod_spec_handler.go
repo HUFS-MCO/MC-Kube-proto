@@ -98,9 +98,6 @@ func (h *PodSpecHandler) DegradePodRequests(ctx context.Context, pod *corev1.Pod
 		return err
 	}
 
-	logger.V(0).Info("Attempting resize patch",
-		"patchData", string(patchBytes))
-
 	if err := h.SubResource("resize").Patch(ctx, pod, client.RawPatch(types.MergePatchType, patchBytes)); err != nil {
 		logger.Error(err, "Resize patch failed")
 		return err
