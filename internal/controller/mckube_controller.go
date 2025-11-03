@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -223,7 +224,20 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				r.ensurePodRuntimeStateInitialized(pod.Name)
 
 				if rt.Spec.RTSettings.Core != nil {
-					targetCores := parseCoreSet(*rt.Spec.RTSettings.Core)
+					// 실제 사용할 core 결정: Status.AllocatedCore가 있으면 우선 사용 (선점으로 변경된 경우)
+					var actualCoreStr string
+					if rt.Status.AllocatedCore != "" {
+						actualCoreStr = rt.Status.AllocatedCore
+					} else {
+						actualCoreStr = *rt.Spec.RTSettings.Core
+						// 초기 할당 시 Status에도 저장
+						rt.Status.AllocatedCore = actualCoreStr
+						if err := r.Status().Update(ctx, rt); err != nil {
+							logger.Error(err, "Failed to initialize allocated core in status")
+						}
+					}
+					
+					targetCores := parseCoreSet(actualCoreStr)
 
 					// RT 설정 기반 CPU 사용량 계산
 					runtimeStateMutex.RLock()
@@ -1003,7 +1017,9 @@ func (r *McKubeReconciler) SendRTRequest(nodeIP string, req CgroupRequest) error
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("RT daemon request failed with status: %d", resp.StatusCode)
+		// 에러 응답 본문 읽기
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("resource-controller request failed with status: %d, body: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	return nil
@@ -1288,12 +1304,12 @@ func (r *McKubeReconciler) updatePodCoreAffinity(ctx context.Context, pod *corev
 		return nil
 	}
 
-	// Core 설정 업데이트
+	// Status에 실제 할당된 Core 업데이트 (Spec은 사용자가 원하는 값으로 유지)
 	newCoreStr := fmt.Sprintf("%d", newCore)
-	targetMcKube.Spec.RTSettings.Core = &newCoreStr
+	targetMcKube.Status.AllocatedCore = newCoreStr
 
-	if err := r.Update(ctx, targetMcKube); err != nil {
-		return fmt.Errorf("failed to update McKube CR: %v", err)
+	if err := r.Status().Update(ctx, targetMcKube); err != nil {
+		return fmt.Errorf("failed to update McKube status: %v", err)
 	}
 
 	logger.V(0).Info("Updated pod core affinity",
@@ -1485,11 +1501,19 @@ func (r *McKubeReconciler) applyRTSettingsToContainers(ctx context.Context, pod 
 			continue
 		}
 
+		// 실제 할당된 core 사용 (Status.AllocatedCore 우선, 없으면 Spec)
+		var coreToUse *string
+		if mckube.Status.AllocatedCore != "" {
+			coreToUse = &mckube.Status.AllocatedCore
+		} else {
+			coreToUse = mckube.Spec.RTSettings.Core
+		}
+
 		req := CgroupRequest{
 			ContainerID: cs.ContainerID,
 			Period:      mckube.Spec.RTSettings.Period,
 			Runtime:     effectiveRuntime,
-			Core:        mckube.Spec.RTSettings.Core,
+			Core:        coreToUse,
 		}
 
 		if err := r.SendRTRequest(nodeIP, req); err != nil {
@@ -1498,7 +1522,7 @@ func (r *McKubeReconciler) applyRTSettingsToContainers(ctx context.Context, pod 
 				"pod", pod.Name,
 				"runtime", effectiveRuntime,
 				"period", mckube.Spec.RTSettings.Period,
-				"core", *mckube.Spec.RTSettings.Core)
+				"core", *coreToUse)
 			return err
 		}
 
@@ -1507,7 +1531,7 @@ func (r *McKubeReconciler) applyRTSettingsToContainers(ctx context.Context, pod 
 			"container", cs.Name,
 			"runtime", effectiveRuntime,
 			"period", mckube.Spec.RTSettings.Period,
-			"core", *mckube.Spec.RTSettings.Core)
+			"core", *coreToUse)
 	}
 
 	return nil

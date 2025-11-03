@@ -75,6 +75,10 @@ spec:
           status:
             description: McKubeStatus defines the observed state of McKube
             properties:
+              allocatedCore:
+                description: AllocatedCore tracks the actual core allocated to the
+                  pod (may differ from Spec.RTSettings.Core due to preemption)
+                type: string
               currentRuntime:
                 description: CurrentRuntime tracks whether the pod is using runtime_low
                   or runtime_hi

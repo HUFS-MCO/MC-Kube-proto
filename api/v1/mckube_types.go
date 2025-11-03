@@ -57,6 +57,8 @@ type McKubeStatus struct {
 	CurrentRuntime string `json:"currentRuntime,omitempty"` // "low" or "hi"
 	// LastOverrunTime tracks when the last overrun was detected
 	LastOverrunTime *metav1.Time `json:"lastOverrunTime,omitempty"`
+	// AllocatedCore tracks the actual core allocated to the pod (may differ from Spec.RTSettings.Core due to preemption)
+	AllocatedCore string `json:"allocatedCore,omitempty"`
 }
 
 // +kubebuilder:object:root=true
