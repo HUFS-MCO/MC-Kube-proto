@@ -247,21 +247,48 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 					criticality := rt.Spec.Criticality
 
-					// 선점 체크 먼저 수행 (CPU Pool에 추가하기 전)
-					loggerHighPrio.Info("Checking preemption for pod",
-						"pod", pod.Name,
-						"cores", targetCores,
-						"cpuMillis", cpuMillis,
-						"criticality", criticality)
-
-					if err := r.checkAndPreemptForPod(ctx, pod, targetCores, cpuMillis, criticality); err != nil {
-						logger.Error(err, "Failed to check preemption for pod", "pod", pod.Name)
+					// CPU Pool에 이미 동일한 설정으로 등록되어 있는지 확인
+					pool := getOrCreateCPUPool(pod.Spec.NodeName, 8)
+					alreadyRegistered := true
+					pool.mu.RLock()
+					for _, coreID := range targetCores {
+						if core, exists := pool.Cores[coreID]; exists {
+							if existingPod, podExists := core.Pods[pod.Name]; !podExists ||
+								existingPod.CPUMillis != cpuMillis ||
+								existingPod.Criticality != criticality {
+								alreadyRegistered = false
+								break
+							}
+						} else {
+							alreadyRegistered = false
+							break
+						}
 					}
-				}
+					pool.mu.RUnlock()
 
-				// 선점 체크 후 CPU Pool 업데이트
-				if err := r.updateCPUPoolForPod(ctx, pod, rt); err != nil {
-					logger.Error(err, "Failed to update CPU pool for pod", "pod", pod.Name)
+					// 이미 등록되어 있지 않은 경우에만 선점 체크 및 업데이트 수행
+					if !alreadyRegistered {
+						// 선점 체크 먼저 수행 (CPU Pool에 추가하기 전)
+						loggerHighPrio.Info("Checking preemption for pod",
+							"pod", pod.Name,
+							"cores", targetCores,
+							"cpuMillis", cpuMillis,
+							"criticality", criticality)
+
+						if err := r.checkAndPreemptForPod(ctx, pod, targetCores, cpuMillis, criticality); err != nil {
+							logger.Error(err, "Failed to check preemption for pod", "pod", pod.Name)
+						}
+
+						// 선점 체크 후 CPU Pool 업데이트
+						if err := r.updateCPUPoolForPod(ctx, pod, rt); err != nil {
+							logger.Error(err, "Failed to update CPU pool for pod", "pod", pod.Name)
+						}
+					}
+				} else {
+					// 선점 체크 없이 CPU Pool 업데이트만 수행
+					if err := r.updateCPUPoolForPod(ctx, pod, rt); err != nil {
+						logger.Error(err, "Failed to update CPU pool for pod", "pod", pod.Name)
+					}
 				}
 
 				// RT 설정을 컨테이너에 적용
@@ -1389,20 +1416,40 @@ func (r *McKubeReconciler) updateCPUPoolForPod(ctx context.Context, pod *corev1.
 	}
 
 	// 각 코어에 Pod 추가 (이미 있으면 업데이트)
+	needsUpdate := false
 	for _, coreID := range podInfo.CoreSet {
-		// 기존에 있으면 제거 후 재추가 (업데이트)
-		pool.removePodFromCore(coreID, pod.Name)
-		pool.addPodToCore(coreID, podInfo)
+		// 기존 정보 확인
+		pool.mu.RLock()
+		core, exists := pool.Cores[coreID]
+		existingPod, podExists := core.Pods[pod.Name]
+		pool.mu.RUnlock()
+
+		// Pod가 이미 동일한 설정으로 등록되어 있는지 확인
+		if !exists || !podExists ||
+			existingPod.CPUMillis != podInfo.CPUMillis ||
+			existingPod.Criticality != podInfo.Criticality {
+			needsUpdate = true
+			break
+		}
 	}
 
-	log.Log.V(0).Info("Updated CPU pool for pod",
-		"pod", pod.Name,
-		"node", nodeName,
-		"cores", podInfo.CoreSet,
-		"cpuMillis", cpuMillis,
-		"runtime", effectiveRuntime,
-		"period", mckube.Spec.RTSettings.Period,
-		"criticality", podInfo.Criticality)
+	// 변경사항이 있을 때만 업데이트
+	if needsUpdate {
+		for _, coreID := range podInfo.CoreSet {
+			// 기존에 있으면 제거 후 재추가 (업데이트)
+			pool.removePodFromCore(coreID, pod.Name)
+			pool.addPodToCore(coreID, podInfo)
+		}
+
+		log.Log.V(0).Info("Updated CPU pool for pod",
+			"pod", pod.Name,
+			"node", nodeName,
+			"cores", podInfo.CoreSet,
+			"cpuMillis", cpuMillis,
+			"runtime", effectiveRuntime,
+			"period", mckube.Spec.RTSettings.Period,
+			"criticality", podInfo.Criticality)
+	}
 
 	return nil
 }
