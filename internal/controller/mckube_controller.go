@@ -146,6 +146,10 @@ var cpuPoolsMutex sync.RWMutex
 var cleanedUpPods = make(map[string]bool)
 var cleanedUpPodsMutex sync.RWMutex
 
+// 노드별 마지막 CPU 상태 추적 (nodeName -> isCpuBusy)
+var lastCpuBusyState = make(map[string]bool)
+var lastCpuBusyStateMutex sync.RWMutex
+
 const coreUtilizationThreshold = 0.9 // 90% 임계값
 
 // ===================== Reconcile =====================
@@ -280,14 +284,26 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				if isCpuBusyStr, exists := ann[ipvs.AnnCpuBusyKey]; exists {
 					isCpuBusy := strings.TrimSpace(isCpuBusyStr) == "true"
 
-					if isCpuBusy {
-						// CPU 압박 상황 처리
-						loggerHighPrio.Info("CPU pressure detected, handling with EventHandler", "node", rt.Spec.Node)
-						r.EventHandler.HandleNodeCPUPressure(ctx, rt.Spec.Node)
-					} else {
-						// CPU 복구 상황 처리
-						loggerHighPrio.Info("CPU recovered, handling with controller", "node", rt.Spec.Node)
-						r.handleCPURecovery(ctx, rt.Spec.Node)
+					// 이전 상태와 비교하여 상태가 변경되었을 때만 처리
+					lastCpuBusyStateMutex.RLock()
+					lastState, hasLastState := lastCpuBusyState[rt.Spec.Node]
+					lastCpuBusyStateMutex.RUnlock()
+
+					// 상태가 변경되었거나 처음 체크하는 경우에만 처리
+					if !hasLastState || lastState != isCpuBusy {
+						lastCpuBusyStateMutex.Lock()
+						lastCpuBusyState[rt.Spec.Node] = isCpuBusy
+						lastCpuBusyStateMutex.Unlock()
+
+						if isCpuBusy {
+							// CPU 압박 상황 처리
+							loggerHighPrio.Info("CPU pressure detected, handling with EventHandler", "node", rt.Spec.Node)
+							r.EventHandler.HandleNodeCPUPressure(ctx, rt.Spec.Node)
+						} else {
+							// CPU 복구 상황 처리
+							loggerHighPrio.Info("CPU recovered, handling with controller", "node", rt.Spec.Node)
+							r.handleCPURecovery(ctx, rt.Spec.Node)
+						}
 					}
 				}
 			}
