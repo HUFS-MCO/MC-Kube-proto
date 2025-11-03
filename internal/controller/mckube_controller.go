@@ -142,6 +142,10 @@ type CPUPool struct {
 var cpuPools = make(map[string]*CPUPool)
 var cpuPoolsMutex sync.RWMutex
 
+// Cleanup 중복 방지를 위한 맵 (podName -> true if cleaned up)
+var cleanedUpPods = make(map[string]bool)
+var cleanedUpPodsMutex sync.RWMutex
+
 const coreUtilizationThreshold = 0.9 // 90% 임계값
 
 // ===================== Reconcile =====================
@@ -567,6 +571,17 @@ func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Obj
 // cleanupPodState : Pod 삭제 시 모든 내부 상태를 정리하는 함수
 func (r *McKubeReconciler) cleanupPodState(podName, namespace string) {
 	logger := log.Log.WithValues("McKube/rt.Cleanup", "PodState", "pod", podName)
+	
+	// 중복 cleanup 방지: 이미 cleanup했다면 스킵
+	cleanedUpPodsMutex.Lock()
+	if cleanedUpPods[podName] {
+		cleanedUpPodsMutex.Unlock()
+		logger.V(1).Info("Skipping duplicate cleanup - already cleaned up")
+		return
+	}
+	cleanedUpPods[podName] = true
+	cleanedUpPodsMutex.Unlock()
+	
 	logger.V(0).Info("Cleaning up internal state for deleted pod")
 
 	// 1. Controller의 podRuntimeState 정리
