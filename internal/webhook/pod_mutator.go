@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -228,7 +229,7 @@ func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.P
 		return false
 	}
 
-	// Call rt-daemon on the node
+	// Call Resource-controller DaemonSet on the node
 	daemonURL := fmt.Sprintf("http://%s:8080/cgroup", nodeIP)
 
 	// Get container ID from pod status
@@ -267,14 +268,19 @@ func (m *PodMutator) applyRTSettingsViaDaemon(ctx context.Context, pod *corev1.P
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Post(daemonURL, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		log.Log.Error(err, "Failed to call rt-daemon", "url", daemonURL)
+		log.Log.Error(err, "Failed to call resource-controller", "url", daemonURL)
 		return false
 	}
 	defer resp.Body.Close()
 
+	// Read response body for debugging
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyString := string(bodyBytes)
+
 	if resp.StatusCode != http.StatusOK {
-		log.Log.Error(fmt.Errorf("rt-daemon returned non-200 status"),
-			"RT daemon error", "status", resp.StatusCode, "url", daemonURL)
+		log.Log.Error(fmt.Errorf("resource-controller returned non-200 status"),
+			"Resource-controller error", "status", resp.StatusCode, "url", daemonURL, 
+			"response", bodyString, "request", string(jsonBody))
 		return false
 	}
 
