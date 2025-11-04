@@ -59,10 +59,6 @@ var (
 	ProcessingNodes = make(map[string]bool)
 	ProcessingMutex sync.RWMutex
 
-	// Runtime state tracking
-	PodRuntimeState   = make(map[string]string) // podName -> "low" or "hi"
-	RuntimeStateMutex sync.RWMutex
-
 	// Criticality ranking
 	CriticalityRank = map[string]int{
 		"Low":    0,

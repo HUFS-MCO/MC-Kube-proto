@@ -80,6 +80,9 @@ const targetNamespace = "default"
 // Taint key (kept for compatibility, not required for eviction fast-path)
 const rtPressureTaintKey = "McKubeRTDeadlinePressure"
 
+// Finalizer name for McKube resources
+const mckubeFinalizer = "mckube.mcoperator.sdv.com/finalizer"
+
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups=mcoperator.sdv.com,resources=mckuberealtimes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=mcoperator.sdv.com,resources=mckubes,verbs=get;list;watch;create;update;patch;delete
@@ -143,10 +146,6 @@ type CPUPool struct {
 var cpuPools = make(map[string]*CPUPool)
 var cpuPoolsMutex sync.RWMutex
 
-// Cleanup 중복 방지를 위한 맵 (podName -> true if cleaned up)
-var cleanedUpPods = make(map[string]bool)
-var cleanedUpPodsMutex sync.RWMutex
-
 // 노드별 마지막 CPU 상태 추적 (nodeName -> isCpuBusy)
 var lastCpuBusyState = make(map[string]bool)
 var lastCpuBusyStateMutex sync.RWMutex
@@ -172,14 +171,50 @@ func (r *McKubeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.Get(ctx, req.NamespacedName, rt); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			loggerLowPrio.Info("McKube/rt resource not found. Likely deleted.")
-			// McKube CR이 삭제되었을 때 해당 Pod 상태도 정리
-			r.cleanupPodStateByMcKubeName(ctx, req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get McKube/rt instance")
 		return ctrl.Result{}, err
 	}
 	loggerLowPrio.Info("McKube resource fetched successfully")
+
+	// ==================== Finalizer 처리 ====================
+	// McKube 리소스가 삭제되는 경우 (DeletionTimestamp가 설정됨)
+	if !rt.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Finalizer가 있는 경우에만 cleanup 수행
+		if containsString(rt.GetFinalizers(), mckubeFinalizer) {
+			loggerHighPrio.Info("McKube resource is being deleted, performing cleanup",
+				"mckube", rt.Name,
+				"podName", rt.Spec.PodName)
+
+			// Cleanup 수행
+			if rt.Spec.PodName != "" {
+				r.cleanupPodState(rt.Spec.PodName, rt.Namespace)
+			}
+
+			// Finalizer 제거
+			rt.SetFinalizers(removeString(rt.GetFinalizers(), mckubeFinalizer))
+			if err := r.Update(ctx, rt); err != nil {
+				logger.Error(err, "Failed to remove finalizer")
+				return ctrl.Result{}, err
+			}
+			loggerHighPrio.Info("Finalizer removed, McKube resource can be deleted")
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// McKube 리소스가 활성 상태인 경우 - Finalizer 추가
+	if !containsString(rt.GetFinalizers(), mckubeFinalizer) {
+		loggerLowPrio.Info("Adding finalizer to McKube resource")
+		rt.SetFinalizers(append(rt.GetFinalizers(), mckubeFinalizer))
+		if err := r.Update(ctx, rt); err != nil {
+			logger.Error(err, "Failed to add finalizer")
+			return ctrl.Result{}, err
+		}
+		loggerLowPrio.Info("Finalizer added successfully")
+		return ctrl.Result{Requeue: true}, nil
+	}
+	// ==================== Finalizer 처리 끝 ====================
 
 	if rt.Spec.PodName == "" {
 		loggerHighPrio.Info("McKube resource has empty spec.PodName. Ignoring...")
@@ -628,17 +663,6 @@ func (r *McKubeReconciler) findObjectsForPod(ctx context.Context, pod client.Obj
 // cleanupPodState : Pod 삭제 시 모든 내부 상태를 정리하는 함수
 func (r *McKubeReconciler) cleanupPodState(podName, namespace string) {
 	logger := log.Log.WithValues("McKube/rt.Cleanup", "PodState", "pod", podName)
-	
-	// 중복 cleanup 방지: 이미 cleanup했다면 스킵
-	cleanedUpPodsMutex.Lock()
-	if cleanedUpPods[podName] {
-		cleanedUpPodsMutex.Unlock()
-		logger.V(1).Info("Skipping duplicate cleanup - already cleaned up")
-		return
-	}
-	cleanedUpPods[podName] = true
-	cleanedUpPodsMutex.Unlock()
-	
 	logger.V(0).Info("Cleaning up internal state for deleted pod")
 
 	// 1. Controller의 podRuntimeState 정리
@@ -649,15 +673,7 @@ func (r *McKubeReconciler) cleanupPodState(podName, namespace string) {
 	}
 	runtimeStateMutex.Unlock()
 
-	// 2. IPVS 패키지의 PodRuntimeState 정리
-	ipvs.RuntimeStateMutex.Lock()
-	if _, exists := ipvs.PodRuntimeState[podName]; exists {
-		delete(ipvs.PodRuntimeState, podName)
-		logger.V(0).Info("Removed pod from IPVS runtime state tracking")
-	}
-	ipvs.RuntimeStateMutex.Unlock()
-
-	// 3. CPU Pool에서 해당 Pod 제거
+	// 2. CPU Pool에서 해당 Pod 제거
 	cpuPoolsMutex.Lock()
 	for nodeName, pool := range cpuPools {
 		pool.mu.Lock()
@@ -710,16 +726,6 @@ func (r *McKubeReconciler) cleanupPodStateByMcKubeName(ctx context.Context, mcKu
 	}
 	runtimeStateMutex.Unlock()
 
-	// IPVS PodRuntimeState 정리
-	ipvs.RuntimeStateMutex.Lock()
-	for podName := range ipvs.PodRuntimeState {
-		if !existingPods[podName] {
-			delete(ipvs.PodRuntimeState, podName)
-			logger.V(0).Info("Cleaned up IPVS runtime state for non-existent pod", "pod", podName)
-		}
-	}
-	ipvs.RuntimeStateMutex.Unlock()
-
 	// CPU Pool 정리
 	cpuPoolsMutex.Lock()
 	for nodeName, pool := range cpuPools {
@@ -751,13 +757,6 @@ func (r *McKubeReconciler) ensurePodRuntimeStateInitialized(podName string) {
 		log.Log.V(0).Info("Initialized pod runtime state to low", "pod", podName)
 	}
 	runtimeStateMutex.Unlock()
-
-	ipvs.RuntimeStateMutex.Lock()
-	if _, exists := ipvs.PodRuntimeState[podName]; !exists {
-		ipvs.PodRuntimeState[podName] = "low" // 기본값으로 low 설정
-		log.Log.V(0).Info("Initialized IPVS pod runtime state to low", "pod", podName)
-	}
-	ipvs.RuntimeStateMutex.Unlock()
 }
 
 // ===================== RT 설정 함수들은 Webhook에서 처리 =====================
@@ -1535,4 +1534,27 @@ func (r *McKubeReconciler) applyRTSettingsToContainers(ctx context.Context, pod 
 	}
 
 	return nil
+}
+
+// ===================== Finalizer 헬퍼 함수들 =====================
+
+// containsString checks if a slice contains a string
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// removeString removes a string from a slice
+func removeString(slice []string, s string) []string {
+	result := []string{}
+	for _, item := range slice {
+		if item != s {
+			result = append(result, item)
+		}
+	}
+	return result
 }
