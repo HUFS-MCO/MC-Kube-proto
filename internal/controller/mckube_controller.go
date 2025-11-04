@@ -1436,7 +1436,11 @@ func (r *McKubeReconciler) updateCPUPoolForPod(ctx context.Context, pod *corev1.
 		// 기존 정보 확인
 		pool.mu.RLock()
 		core, exists := pool.Cores[coreID]
-		existingPod, podExists := core.Pods[pod.Name]
+		var existingPod PodInfo
+		var podExists bool
+		if exists {
+			existingPod, podExists = core.Pods[pod.Name]
+		}
 		pool.mu.RUnlock()
 
 		// Pod가 이미 동일한 설정으로 등록되어 있는지 확인
